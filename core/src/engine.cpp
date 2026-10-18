@@ -168,6 +168,7 @@ Engine::Engine(EngineConfig cfg) : cfg_(std::move(cfg)) {
   sp.set_int(lt::settings_pack::min_reconnect_time, cfg_.min_reconnect_time_s);
   if (cfg_.download_rate_limit > 0) sp.set_int(lt::settings_pack::download_rate_limit, cfg_.download_rate_limit);
   if (cfg_.upload_rate_limit > 0) sp.set_int(lt::settings_pack::upload_rate_limit, cfg_.upload_rate_limit);
+  if (cfg_.web_seed_max_request_bytes > 0) sp.set_int(lt::settings_pack::urlseed_max_request_bytes, cfg_.web_seed_max_request_bytes);
   if (cfg_.loopback_test_mode) {
     sp.set_bool(lt::settings_pack::allow_multiple_connections_per_ip, true);
     sp.set_int(lt::settings_pack::out_enc_policy, lt::settings_pack::pe_disabled);

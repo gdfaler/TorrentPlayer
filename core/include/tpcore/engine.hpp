@@ -30,6 +30,10 @@ struct EngineConfig {
   int min_reconnect_time_s = 1;                     // verified necessary (default 60 s stalled playback)
   int download_rate_limit = 0;                      // bytes/s, 0 = unlimited
   int upload_rate_limit = 0;
+  // Largest sequential HTTP range a web seed may be asked for in one request (libtorrent default 16 MiB). A single web-seed connection is busy until its
+  // current range is complete, so a long range delays a more urgent piece (for example a trailing MP4 index) by range/rate seconds; libtorrent ignores values
+  // below the torrent's piece size, so larger pieces simply keep one piece per request. 0 keeps the libtorrent default.
+  int web_seed_max_request_bytes = 4 * 1024 * 1024;
   std::filesystem::path evidence_dir;               // hash-failure evidence (default cache_root/evidence)
 };
 

@@ -47,8 +47,8 @@ final class PlayerSession: NSObject {
     private var lastTPState = -1
     private var firstPeerLogged = false, firstPieceLogged = false
     private var stallStart: Double?, stallStartState = "", stallStartPeers = 0
-    private struct SeekRecord { var target: Double; var issued: Double; var fromPos: Double; var coveredAtTarget: Int }
-    private var seekPending: SeekRecord?
+    private var seekTracker = SeekTracker()
+    private var seekPending: SeekTracker.Record? { seekTracker.pending }
     private(set) var seekLatencies: [Double] = []
     private(set) var stallDurations: [Double] = []
     private var lastMouseMove = Date(), lastMouse = NSPoint.zero
@@ -159,7 +159,7 @@ final class PlayerSession: NSObject {
             let name = String(cString: p.name)
             if p.format == MPV_FORMAT_DOUBLE {
                 let v = data.assumingMemoryBound(to: Double.self).pointee
-                if name == "time-pos" { timePos = v } else if name == "duration" { if v > 0 && duration != v { duration = v; durationKnown() } }
+                if name == "time-pos" { timePos = v; if let c = seekTracker.positionUpdated(v) { emitSeekDone(c) } } else if name == "duration" { if v > 0 && duration != v { duration = v; durationKnown() } }
             } else if p.format == MPV_FORMAT_FLAG {
                 let v = data.assumingMemoryBound(to: Int32.self).pointee != 0
                 switch name {
@@ -173,18 +173,15 @@ final class PlayerSession: NSObject {
         case MPV_EVENT_FILE_LOADED:
             fileLoaded = true; telemetry.emit("file_loaded", ["since_open_s": since()])
         case MPV_EVENT_SEEK:
-            break
+            seekTracker.seekStarted()
         case MPV_EVENT_PLAYBACK_RESTART:
             if !playbackStarted {
                 playbackStarted = true
                 telemetry.emit("playback_started", ["since_open_s": since(), "note": "first PLAYBACK_RESTART (decoder running); approximates first frame"])
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in self?.reportGeometry() }
             }
-            if let r = seekPending {
-                let lat = telemetry.now - r.issued
-                seekLatencies.append(lat); seekPending = nil
-                telemetry.emit("seek_done", ["target_s": r.target, "latency_s": lat, "landed_s": timePos, "from_s": r.fromPos, "cache_coverage_at_target_0_255": r.coveredAtTarget])
-            }
+            // Completes the pending seek only when mpv reported that seek's start; `seek_done` is written once the position after the restart is known.
+            if let lat = seekTracker.restarted(now: telemetry.now) { seekLatencies.append(lat) }
         case MPV_EVENT_END_FILE:
             guard let d = ev.pointee.data else { return }
             let ef = d.assumingMemoryBound(to: mpv_event_end_file.self).pointee
@@ -241,10 +238,14 @@ final class PlayerSession: NSObject {
         guard duration > 1, let s = stream else { return }
         let t = max(0, min(duration - 1.0, target))
         let cov = coverageValue(at: t / duration)
-        seekPending = SeekRecord(target: t, issued: telemetry.now, fromPos: timePos, coveredAtTarget: cov)
+        if let previous = seekTracker.issue(target: t, now: telemetry.now, fromPos: timePos, coveredAtTarget: cov) { emitSeekDone(previous) }
         s.seekHint(Int64(t / duration * Double(s.size)))
         telemetry.emit("seek_issued", ["target_s": t, "from_s": timePos, "exact": exact, "cache_coverage_at_target_0_255": cov])
         cmd(["seek", String(format: "%.3f", t), exact ? "absolute+exact" : "absolute+keyframes"])
+    }
+    private func emitSeekDone(_ c: SeekTracker.Completed) {
+        telemetry.emit("seek_done", ["target_s": c.record.target, "latency_s": c.latency, "landed_s": c.landed, "landed_source": c.landedSource, "from_s": c.record.fromPos,
+                                     "cache_coverage_at_target_0_255": c.record.coveredAtTarget, "seek_event_seen": c.matchedSeekEvent])
     }
     func seekRelative(_ d: Double) { seek(to: timePos + d, exact: abs(d) <= 10) }
     func seekFraction(_ f: Double) { seek(to: f * duration, exact: false) }
@@ -410,6 +411,7 @@ final class PlayerSession: NSObject {
         }
         if !firstPeerLogged && r.peers > 0 { firstPeerLogged = true; telemetry.emit("first_peer", ["since_open_s": since(), "peers": r.peers]) }
         if !firstPieceLogged && r.pieces_verified > 0 { firstPieceLogged = true; telemetry.emit("first_piece", ["since_open_s": since()]) }
+        if let c = seekTracker.flush(now: telemetry.now, lastPos: timePos) { emitSeekDone(c) }   // the position update after a restart never arrived (target equals the old position)
         let bitrate = duration > 1 ? Double(s.size) / duration : 0
         telemetry.emit("sample", [
             "state": st.stateName, "state_qualified": qualifiedState(st), "peers": r.peers, "seeds": r.seeds, "web_connections": r.web_connections, "download_Bps": r.download_rate,
