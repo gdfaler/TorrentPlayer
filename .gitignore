@@ -1,0 +1,19 @@
+# Build outputs and release artifacts
+build/
+dist/
+
+# Local test evidence and experiment records
+docs/gate_results/
+docs/proposals/
+
+# Internal status documents containing local paths
+docs/MILESTONE1_STATUS.md
+docs/MILESTONE2_STATUS.md
+docs/TEST_VOLUME_CLEANUP_INVENTORY.md
+
+# Generated and temporary files
+__pycache__/
+*.pyc
+*.log
+*.sparseimage
+.DS_Store

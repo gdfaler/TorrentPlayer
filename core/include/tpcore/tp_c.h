@@ -1,0 +1,105 @@
+/* tp_c.h: the narrow, C-compatible interface between the native app (Swift/AppKit) and the C++ core (tpcore).
+ * No C++ types cross this boundary. All functions are thread-safe unless stated; none throw. Strings are UTF-8, caller-owned buffers with explicit sizes.
+ * Hostile input (torrent files, magnet links, peers) is bounds-checked inside; failures are reported through the err buffer / return codes. */
+#ifndef TP_C_H
+#define TP_C_H
+#include <stddef.h>
+#include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct tp_engine tp_engine;
+typedef struct tp_meta tp_meta;       /* torrent metadata: loaded from a .torrent file or fetched for a magnet link */
+typedef struct tp_stream tp_stream;   /* one streamed file of one torrent */
+typedef struct tp_cancel tp_cancel;   /* cancellation token for blocking reads */
+
+typedef struct {
+  const char* cache_root;             /* streaming cache root (per-torrent directories live here) */
+  const char* evidence_dir;           /* hash-failure evidence; NULL = <cache_root>/evidence */
+  const char* listen_interfaces;      /* NULL = "0.0.0.0:6881,[::]:6881" */
+  int loopback_test_mode;             /* tests only */
+  int enable_dht;                     /* 1 default behaviour when listen_interfaces is NULL; tests set 0 */
+} tp_engine_config;
+
+tp_engine* tp_engine_create(const tp_engine_config* cfg, char* err, size_t errlen);
+void tp_engine_destroy(tp_engine*);
+
+/* ---- metadata */
+typedef enum { TP_META_FETCHING = 0, TP_META_READY = 1, TP_META_FAILED = 2 } tp_meta_state;
+typedef struct { int state; int peers; double elapsed_s; char error[160]; } tp_meta_status;
+
+tp_meta* tp_meta_from_file(tp_engine*, const char* path, char* err, size_t errlen);
+tp_meta* tp_meta_from_magnet(tp_engine*, const char* magnet_uri, char* err, size_t errlen);  /* starts fetching; poll tp_meta_status_get */
+void tp_meta_status_get(tp_meta*, tp_meta_status* out);       /* fetching / ready / failed (+ peers seen while fetching) */
+void tp_meta_cancel(tp_meta*);
+void tp_meta_free(tp_meta*);                                  /* cancels if still fetching */
+int tp_meta_name(tp_meta*, char* out, size_t outlen);         /* torrent name; 0 if not ready */
+int tp_meta_file_count(tp_meta*);                             /* 0 until ready */
+int tp_meta_file_info(tp_meta*, int index, char* path_out, size_t pathlen, int64_t* size_out, int* is_video_out);
+int tp_meta_default_video(tp_meta*);                          /* index of the largest video file, or -1 if there is none */
+/* tests / known peers: "ip:port" added to the next stream opened from this metadata */
+void tp_meta_add_peer(tp_meta*, const char* ip_port);
+
+/* ---- streaming */
+typedef struct {
+  int64_t cache_limit_bytes;          /* user-visible limit; 0 = 2 GiB */
+  double behind_seconds;              /* 0 = 300 */
+  double ahead_seconds;               /* 0 = 75 (automatic target) */
+  int web_seed_mode;                  /* 0 off, 1 assist (default), 2 always */
+} tp_stream_options;
+
+tp_stream* tp_stream_open(tp_engine*, tp_meta*, int file_index, const tp_stream_options*, char* err, size_t errlen);
+void tp_stream_close(tp_stream*);
+int64_t tp_stream_size(tp_stream*);
+int tp_stream_file_name(tp_stream*, char* out, size_t outlen);
+
+tp_cancel* tp_cancel_new(void);
+void tp_cancel_set(tp_cancel*, int cancelled);
+void tp_cancel_free(tp_cancel*);
+/* Blocking read. Returns bytes copied (>0), 0 at EOF, -1 if cancelled. Never copies across a piece boundary. cancel may be NULL. */
+int64_t tp_stream_read(tp_stream*, int64_t offset, void* buf, int64_t len, tp_cancel* cancel);
+void tp_stream_seek_hint(tp_stream*, int64_t offset);        /* the user is about to go there */
+void tp_stream_set_bitrate(tp_stream*, double bytes_per_second);
+
+typedef enum {
+  TP_STATE_CONNECTING = 0, TP_STATE_NO_PEERS, TP_STATE_PREPARING, TP_STATE_BUFFERING, TP_STATE_READY, TP_STATE_STALLED, TP_STATE_DISK_PAUSED, TP_STATE_ERROR
+} tp_state;
+
+typedef struct {
+  int state;                          /* tp_state */
+  char state_text[64];                /* human-readable, e.g. "No peers found" */
+  int peers, seeds, web_connections;
+  double download_rate, upload_rate;  /* bytes/s */
+  int64_t peer_bytes, web_bytes;
+  int blocked_readers;                /* reads waiting for data right now */
+  int64_t piece_size; int num_pieces;
+  int head_piece, window_lo, window_hi_full, window_hi_wanted, contiguous_ahead_pieces;
+  int64_t contiguous_ahead_bytes;
+  int refilling;
+  /* cache accounting (the tested strict-cap machinery) */
+  int64_t cache_limit, cache_internal_cap, cache_charged, cache_max_charged;
+  int64_t cap_violations, refused_writes, forced_evictions;
+  int pieces_present;
+  int disk_state;                     /* 0 ok, 1 warning, 2 paused */
+  /* integrity */
+  int hash_failures, hash_storage, hash_arrived, hash_undetermined, pieces_verified, peer_bans;
+  /* recovery / resilience */
+  int un_have_resets, watchdog_kicks, watchdog_resets;
+  double seconds_without_peers;
+  int web_seed_active;
+  int recovery_verified, recovery_deleted_partial, recovery_deleted_corrupt, recovery_trimmed;
+} tp_stream_status;
+void tp_stream_status_get(tp_stream*, tp_stream_status* out);
+
+/* Coverage for the seek bar: out[i] in 0..255 = fraction of the i-th of n equal file buckets that is present in the cache. */
+void tp_stream_coverage(tp_stream*, int n, uint8_t* out);
+/* Recent events (newline separated), most recent last; returns bytes written. */
+int tp_stream_events(tp_stream*, char* out, size_t outlen);
+/* Hash-failure evidence is classified by the core; this returns a one-line summary of the last report ("" if none). */
+int tp_stream_last_hash_report(tp_stream*, char* out, size_t outlen);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
