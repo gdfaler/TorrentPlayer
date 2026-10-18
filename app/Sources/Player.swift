@@ -415,7 +415,7 @@ final class PlayerSession: NSObject {
             "state": st.stateName, "state_qualified": qualifiedState(st), "peers": r.peers, "seeds": r.seeds, "web_connections": r.web_connections, "download_Bps": r.download_rate,
             "ahead_bytes": r.contiguous_ahead_bytes, "ahead_s": bitrate > 0 ? Double(r.contiguous_ahead_bytes) / bitrate : -1, "blocked_readers": r.blocked_readers,
             "cache_charged": r.cache_charged, "cache_limit": r.cache_limit, "pieces_present": r.pieces_present, "pieces_verified": r.pieces_verified,
-            "hash_failures": r.hash_failures, "un_have_resets": r.un_have_resets, "watchdog_kicks": r.watchdog_kicks, "cap_violations": r.cap_violations,
+            "hash_failures": r.hash_failures, "hash_incomplete": r.hash_incomplete, "un_have_resets": r.un_have_resets, "watchdog_kicks": r.watchdog_kicks, "cap_violations": r.cap_violations,
             "time_pos_s": timePos, "paused": paused, "paused_for_cache": pausedForCache, "seeking": seekPending != nil, "peer_bytes": r.peer_bytes, "web_bytes": r.web_bytes]
             .merging(WaitText.fields(r)) { a, _ in a })
         // a prolonged wait for one piece is recorded with the core's own event log and the last web-seed error (facts for diagnosis; no conclusion is drawn here)

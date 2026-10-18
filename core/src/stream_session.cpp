@@ -46,6 +46,12 @@ StreamSession::StreamSession(Engine& e, std::shared_ptr<lt::torrent_info> ti, in
   save_path_ = (eng_.config().cache_root / ihex_).string();
   StoreParams sp;
   sp.dir = save_path_; sp.piece_size = geo_.piece_size; sp.num_pieces = num_pieces_; sp.total_size = ti_->total_size();
+  {                                                                           // BEP 47: padding files are implicit zeros (libtorrent never requests them)
+    std::vector<std::pair<std::int64_t, std::int64_t>> pad_files;
+    for (int i = 0; i < files.num_files(); ++i)
+      if (files.pad_file_at(lt::file_index_t(i))) pad_files.emplace_back(files.file_offset(lt::file_index_t(i)), files.file_size(lt::file_index_t(i)));
+    sp.pads = build_piece_pads(pad_files, geo_.piece_size, ti_->total_size(), num_pieces_);
+  }
   sp.limit_bytes = cfg_.limit_bytes;
   sp.margin_bytes = cfg_.limit_bytes ? cfg_.limit_bytes - internal_cap(cfg_, geo_.piece_size) : 0;
   store_ = std::make_shared<SegmentStore>(sp);
@@ -246,15 +252,32 @@ void StreamSession::update_wait_info(double t) {
   { std::lock_guard<std::mutex> g(cfg_mu_); ha = planner_.pin_head_first(); hb = planner_.pin_head_last(); ta = planner_.pin_tail_first(); tb = planner_.pin_tail_last(); }
   std::vector<lt::partial_piece_info> q;
   try { q = h_.get_download_queue(); } catch (std::exception const&) {}
-  auto blocks_of = [&](int p, int& total, int& done, int& writing, int& requested, bool& inq) {
-    total = blocks_in_piece(ti_->piece_size(lt::piece_index_t(p)));
+  // Progress counts REAL data blocks only: padding blocks (BEP 47) are never downloaded; libtorrent marks them finished, which must not look like progress.
+  auto blocks_of = [&](int p, int& total, int& done, int& writing, int& requested, int& pad, bool& inq) {
+    const std::int64_t plen = ti_->piece_size(lt::piece_index_t(p));
+    const int all = blocks_in_piece(plen);
+    const auto& pads = store_->pads_of(p);
+    pad = 0;
+    for (int b = 0; b < all; ++b) if (block_is_pad(b, plen, pads)) ++pad;
+    total = all - pad;
     done = writing = requested = 0; inq = false;
     if (store_->has(p)) { done = total; return; }
-    for (auto const& pp : q) if (static_cast<int>(pp.piece_index) == p) { done = pp.finished; writing = pp.writing; requested = pp.requested; inq = true; break; }
+    for (auto const& pp : q) {
+      if (static_cast<int>(pp.piece_index) != p) continue;
+      inq = true;
+      if (pp.blocks) {
+        for (int b = 0; b < pp.blocks_in_piece && b < all; ++b) {
+          if (block_is_pad(b, plen, pads)) continue;
+          const auto st = pp.blocks[b].state;
+          if (st == lt::block_info::finished) ++done; else if (st == lt::block_info::writing) ++writing; else if (st == lt::block_info::requested) ++requested;
+        }
+      } else { done = pp.finished; writing = pp.writing; requested = pp.requested; }
+      break;
+    }
   };
   auto pin = [&](int a, int b, int& np, int& present, int& bt, int& bd) {
     np = std::max(0, b - a + 1); present = bt = bd = 0;
-    for (int p = a; p <= b; ++p) { int t_, d_, w_, r_; bool iq; blocks_of(p, t_, d_, w_, r_, iq); bt += t_; bd += d_; present += store_->has(p) ? 1 : 0; }
+    for (int p = a; p <= b; ++p) { int t_, d_, w_, r_, pd_; bool iq; blocks_of(p, t_, d_, w_, r_, pd_, iq); bt += t_; bd += d_; present += store_->has(p) ? 1 : 0; }
   };
   pin(ha, hb, w.head_pin_pieces, w.head_pin_present, w.head_pin_blocks_total, w.head_pin_blocks_done);
   pin(ta, tb, w.tail_pin_pieces, w.tail_pin_present, w.tail_pin_blocks_total, w.tail_pin_blocks_done);
@@ -271,7 +294,7 @@ void StreamSession::update_wait_info(double t) {
   w.piece = need;
   w.kind = classify_wait_piece(need, ha, hb, ta, tb);
   if (need >= 0) {
-    blocks_of(need, w.blocks_total, w.blocks_done, w.blocks_writing, w.blocks_requested, w.in_queue);
+    blocks_of(need, w.blocks_total, w.blocks_done, w.blocks_writing, w.blocks_requested, w.blocks_pad, w.in_queue);
     try { w.priority = static_cast<int>(static_cast<std::uint8_t>(h_.piece_priority(lt::piece_index_t(need)))); } catch (...) { w.priority = -1; }
     auto it = deadlines_applied_.find(need);
     w.deadline_ms = it == deadlines_applied_.end() ? -1 : it->second;

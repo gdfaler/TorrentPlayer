@@ -99,16 +99,17 @@ class SegmentDisk final : public lt::disk_interface, public lt::buffer_allocator
       const Sha1& exp = ts->expected[pc];
       if (ts->store->has(pc)) { std::memcpy(out.data(), exp.data(), 20); }          // verified earlier by us: trusted (used by recheck fallback)
       else {
-        Sha1 got;
-        if (ts->store->compute_sha1(pc, got)) {
-          std::vector<char> bytes(static_cast<std::size_t>(ts->store->piece_size_of(pc)));
-          const bool read_ok = ts->store->read(pc, 0, bytes.data(), static_cast<int>(bytes.size())) >= 0;
+        // Assemble the logical piece: real data from the cache, BEP 47 padding ranges as implicit zeros (they are never downloaded or stored).
+        // Incomplete (real data missing) is NOT a hash failure: the all-zero result below tells libtorrent the piece is not available yet, and the store counts it.
+        std::vector<char> bytes;
+        if (ts->store->logical_piece(pc, /*live=*/true, bytes) == HashStatus::Ok) {
+          const Sha1 got = sha1_of(bytes.data(), bytes.size());
           std::memcpy(out.data(), got.data(), 20);
           if (got == exp) {
-            if (ts->store->mark_verified(pc)) { if (read_ok) ts->shadow->on_pass(pc, bytes); if (ts->on_hash) ts->on_hash(pc, true); }
+            if (ts->store->mark_verified(pc)) { ts->shadow->on_pass(pc, bytes); if (ts->on_hash) ts->on_hash(pc, true); }
             else std::memset(out.data(), 0, 20);          // evicted concurrently: report "missing" (zero hash), not a failure
           }
-          else { if (read_ok) ts->shadow->on_failure(pc, bytes, exp); if (ts->on_hash) ts->on_hash(pc, false); }
+          else { ts->shadow->on_failure(pc, bytes, exp); ts->store->forget_written(pc); if (ts->on_hash) ts->on_hash(pc, false); }   // genuine mismatch: libtorrent re-downloads the piece
         }
       }
     }

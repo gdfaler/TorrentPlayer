@@ -80,6 +80,7 @@ void SegmentStore::evict_locked_io(int piece) {
   std::error_code ec;
   fs::remove(piece_path(piece), ec);
   std::lock_guard<std::mutex> g(mu_);
+  written_.erase(piece);
   if (present_flag_[piece]) { present_flag_[piece] = 0; present_set_.erase(piece); }
   if (charge_[piece]) { charged_ -= charge_[piece]; charge_[piece] = 0; }
   ++epoch_;
@@ -182,6 +183,7 @@ WriteStatus SegmentStore::write(int piece, int offset, const void* buf, int len)
     std::lock_guard<std::mutex> g(mu_);
     charge_locked(piece);
     touch_ns_[piece] = now_ns();
+    if (!pads_of(piece).empty()) written_[piece].add(offset, len);          // remember which real bytes arrived (padded pieces only)
   }
   ++epoch_;
   ++writes_;
@@ -198,16 +200,58 @@ int SegmentStore::read(int piece, int offset, void* buf, int len) const {
   return n == len ? len : -1;
 }
 
-bool SegmentStore::compute_sha1(int piece, Sha1& out) const {
+const std::vector<PadRange>& SegmentStore::pads_of(int piece) const {
+  static const std::vector<PadRange> none;
+  return (piece >= 0 && static_cast<std::size_t>(piece) < p_.pads.size()) ? p_.pads[static_cast<std::size_t>(piece)] : none;
+}
+
+HashStatus SegmentStore::logical_piece(int piece, bool live, std::vector<char>& bytes) const {
+  if (piece < 0 || piece >= p_.num_pieces) return HashStatus::Missing;
   const std::int64_t sz = piece_size_of(piece);
-  std::vector<char> b(static_cast<std::size_t>(sz));
+  const std::vector<PadRange>& pads = pads_of(piece);
   int fd = ::open(piece_path(piece).c_str(), O_RDONLY);
-  if (fd < 0) return false;
-  ssize_t n = ::pread(fd, b.data(), b.size(), 0);
+  if (fd < 0) return HashStatus::Missing;
+  bytes.assign(static_cast<std::size_t>(sz), 0);                    // padding ranges stay zero: they are never read from disk
+  HashStatus r = HashStatus::Ok;
+  if (pads.empty()) {                                               // ordinary piece: the whole file must be there
+    const ssize_t n = ::pread(fd, bytes.data(), bytes.size(), 0);
+    if (n != static_cast<ssize_t>(bytes.size())) r = HashStatus::Incomplete;
+  } else {
+    const std::vector<PadRange> real = real_ranges(sz, pads);
+    if (live) {                                                     // every real byte range must have been written in this run
+      std::lock_guard<std::mutex> g(mu_);
+      auto it = written_.find(piece);
+      for (const auto& rr : real) if (it == written_.end() || !it->second.covers(rr.start, rr.len)) { r = HashStatus::Incomplete; break; }
+    }
+    if (r == HashStatus::Ok) {
+      for (const auto& rr : real) {
+        const ssize_t n = ::pread(fd, bytes.data() + rr.start, static_cast<std::size_t>(rr.len), rr.start);
+        if (n != static_cast<ssize_t>(rr.len)) { r = HashStatus::Incomplete; break; }
+      }
+    }
+  }
   ::close(fd);
-  if (n != static_cast<ssize_t>(b.size())) return false;
+  if (r == HashStatus::Incomplete && live) ++hash_incomplete_;
+  return r;
+}
+
+void SegmentStore::forget_written(int piece) {
+  std::lock_guard<std::mutex> g(mu_);
+  written_.erase(piece);
+}
+
+bool SegmentStore::compute_sha1(int piece, Sha1& out) const {
+  std::vector<char> b;
+  if (logical_piece(piece, false, b) != HashStatus::Ok) return false;
   out = sha1_of(b.data(), b.size());
   return true;
+}
+
+bool SegmentStore::file_size_acceptable(int piece, std::int64_t size) const {
+  const std::int64_t sz = piece_size_of(piece);
+  const std::vector<PadRange>& pads = pads_of(piece);
+  if (pads.empty()) return size == sz;
+  return size >= real_end(sz, pads) && size <= sz;                    // padded piece: the file may stop after the last real byte
 }
 
 bool SegmentStore::mark_verified(int piece) {
@@ -217,6 +261,7 @@ bool SegmentStore::mark_verified(int piece) {
     std::lock_guard<std::mutex> g(mu_);
     if (charge_[piece] == 0) return false;                         // evicted (or never written): nothing to verify
     if (!present_flag_[piece]) { present_flag_[piece] = 1; present_set_.insert(piece); }
+    written_.erase(piece);                                         // verified: the write record is no longer needed
     touch_ns_[piece] = now_ns();
   }
   cv_.notify_all();
@@ -287,7 +332,7 @@ RecoveryReport SegmentStore::recover(const VerifyFn& verify, int head_hint) {
   for (auto& [pn, path] : files) {
     struct stat st;
     if (::stat(path.c_str(), &st) != 0) continue;
-    if (st.st_size != piece_size_of(pn)) { fs::remove(path, ec); ++r.deleted_partial; continue; }
+    if (!file_size_acceptable(pn, st.st_size)) { fs::remove(path, ec); ++r.deleted_partial; continue; }
     complete.emplace_back(pn, path);
   }
   // 2) TRIM FIRST (before hashing and before charging anything): keep the pieces closest to the head hint that fit under the internal cap
@@ -318,7 +363,7 @@ StoreMetrics SegmentStore::metrics() const {
   m.limit = limit_; m.internal_cap = internal_cap(); m.charged = charged_.load(); m.max_charged = max_charged_.load();
   m.forced_evictions = forced_evictions_.load(); m.sweep_evictions = sweep_evictions_.load(); m.refused_writes = refused_writes_.load();
   m.reserve_calls = reserve_calls_.load(); m.reconcile_corrections = reconcile_corrections_.load(); m.cap_violations = cap_violations_.load();
-  m.writes = writes_.load(); m.rewrites_identical = rw_same_.load(); m.rewrites_different = rw_diff_.load();
+  m.writes = writes_.load(); m.rewrites_identical = rw_same_.load(); m.rewrites_different = rw_diff_.load(); m.hash_incomplete = hash_incomplete_.load();
   std::lock_guard<std::mutex> g(mu_);
   m.present = static_cast<int>(present_set_.size());
   int partial = 0;

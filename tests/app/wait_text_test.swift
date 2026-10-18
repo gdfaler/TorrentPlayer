@@ -50,12 +50,23 @@ import Foundation
         c = WaitText.beforePlayback(base(TP_STATE_READY), fileSize: size, rate: "", aheadText: "")!
         check(c.title == "Starting playback…", "ready-but-not-started wording")
         // 7. states handled elsewhere return nil
-        for s in [TP_STATE_CONNECTING, TP_STATE_NO_PEERS, TP_STATE_DISK_PAUSED, TP_STATE_ERROR, TP_STATE_STALLED] { check(WaitText.beforePlayback(base(s), fileSize: size, rate: "", aheadText: "") == nil, "state \(s) is left to the existing banner") }
+        for s in [TP_STATE_CONNECTING, TP_STATE_NO_PEERS, TP_STATE_DISK_PAUSED, TP_STATE_ERROR] { check(WaitText.beforePlayback(base(s), fileSize: size, rate: "", aheadText: "") == nil, "state \(s) is left to the existing banner") }
+        // 7b. Stalled keeps the specific waiting reason (and the facts) instead of a generic message
+        var st = base(TP_STATE_STALLED)
+        st.wait_kind = 2; st.wait_piece = 1626; st.blocked_readers = 1; st.wait_blocks_total = 45; st.wait_blocks_done = 1; st.wait_peers_total = 9; st.wait_peers_with_piece = 1; st.web_connections = 3; st.wait_no_progress_s = 120
+        c = WaitText.beforePlayback(st, fileSize: size, rate: "0 KB/s", aheadText: "")!
+        check(c.title == "Stalled" && c.detail == "No data is arriving for the video's index at the end of the file", "stalled keeps the waiting reason: \(c.detail)")
+        check(c.note.contains("1 of 45 blocks received") && c.note.contains("1 of 9 connected peers report having it") && c.note.contains("No new data for this part of the file for 120 s"), "stalled keeps the facts: \(c.note)")
+        check(abs((c.progress ?? -1) - 1.0 / 45.0) < 1e-9, "stalled progress counts real blocks only")
+        var st2 = base(TP_STATE_STALLED); st2.wait_kind = 3; st2.wait_piece = 900; st2.wait_offset = size / 4
+        check(WaitText.beforePlayback(st2, fileSize: size, rate: "", aheadText: "")!.detail == "No data is arriving for the data at 25% of the file", "stalled data wait wording")
+        // a Stalled state with nothing known to wait for stays with the existing generic banner
+        check(WaitText.beforePlayback(base(TP_STATE_STALLED), fileSize: size, rate: "", aheadText: "") == nil, "stalled without wait facts is left to the existing banner")
         // 8. singular wording and telemetry fields
         var one = base(TP_STATE_PREPARING); one.wait_kind = 2; one.wait_piece = 5; one.wait_blocks_total = 1; one.wait_blocks_done = 0; one.wait_peers_total = 1; one.wait_peers_with_piece = 1
         check(WaitText.facts(one).contains("0 of 1 block received") && WaitText.facts(one).contains("1 of 1 connected peer report"), "singular forms: \(WaitText.facts(one))")
         let f = WaitText.fields(r)
-        check((f["wait_kind"] as? String) == "head_index" && (f["wait_piece"] as? Int32) == 1626 && f["tail_pin_blocks_total"] != nil, "telemetry fields present")
+        check((f["wait_kind"] as? String) == "head_index" && (f["wait_piece"] as? Int32) == 1626 && f["tail_pin_blocks_total"] != nil && f["wait_blocks_pad"] != nil && f["hash_incomplete"] != nil, "telemetry fields present")
         print("\(checks) checks, \(failures) failures")
         exit(failures == 0 ? 0 : 1)
     }

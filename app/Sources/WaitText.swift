@@ -19,7 +19,7 @@ enum WaitText {
     static func size(_ b: Int64) -> String { ByteCountFormatter.string(fromByteCount: b, countStyle: .binary) }
     static func plural(_ n: Int, _ w: String) -> String { "\(n) \(w)\(n == 1 ? "" : "s")" }
 
-    /// The facts about the piece the player needs next, e.g. "12 of 128 blocks received · 0 of 9 connected peers report having it · web seed connected".
+    /// The facts about the piece the player needs next (REAL data blocks only; BEP 47 padding blocks are never counted), e.g. "12 of 45 blocks received · 0 of 9 connected peers report having it · web seed connected".
     static func facts(_ r: tp_stream_status) -> String {
         guard r.wait_piece >= 0 else { return "" }
         var parts: [String] = []
@@ -66,6 +66,17 @@ enum WaitText {
                 return BannerContent(title: "Buffering…", detail: detail, spinning: true, retry: false, note: note([idle, aheadText].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")), progress: prog)
             }
             return BannerContent(title: "Buffering…", detail: "\(aheadText) · \(rate)", spinning: true, retry: false)
+        case Int(TP_STATE_STALLED.rawValue):
+            // keep the specific waiting reason when the core reports Stalled (no payload for a while), instead of falling back to a generic text
+            guard r.wait_piece >= 0, r.wait_kind != 0 else { return nil }
+            let what: String
+            switch Int(r.wait_kind) {
+            case 2: what = "the video's index at the end of the file"
+            case 1: what = "the video's index at the start of the file"
+            default:
+                if fileSize > 0, r.wait_offset >= 0 { what = "the data at \(Int((Double(r.wait_offset) / Double(fileSize) * 100).rounded()))% of the file" } else { what = "the file data" }
+            }
+            return BannerContent(title: "Stalled", detail: "No data is arriving for \(what)", spinning: true, retry: false, note: note(WaitText.idleText(r)), progress: prog)
         case Int(TP_STATE_READY.rawValue):
             return BannerContent(title: "Starting playback…", detail: "Data is available; waiting for the video decoder to start", spinning: true, retry: false)
         default:
@@ -78,7 +89,7 @@ enum WaitText {
         let kind = ["none", "head_index", "tail_index", "data"][max(0, min(3, Int(r.wait_kind)))]
         return ["wait_kind": kind, "wait_offset": r.wait_offset, "wait_piece": r.wait_piece, "wait_piece_priority": r.wait_piece_priority,
                 "wait_piece_deadline_ms": r.wait_piece_deadline_ms, "wait_blocks_total": r.wait_blocks_total, "wait_blocks_done": r.wait_blocks_done,
-                "wait_blocks_writing": r.wait_blocks_writing, "wait_blocks_requested": r.wait_blocks_requested, "wait_in_queue": r.wait_in_queue != 0,
+                "wait_blocks_writing": r.wait_blocks_writing, "wait_blocks_requested": r.wait_blocks_requested, "wait_blocks_pad": r.wait_blocks_pad, "hash_incomplete": r.hash_incomplete, "wait_in_queue": r.wait_in_queue != 0,
                 "wait_peers_total": r.wait_peers_total, "wait_peers_with_piece": r.wait_peers_with_piece, "wait_peers_requesting": r.wait_peers_requesting,
                 "wait_web_requesting": r.wait_web_requesting, "wait_no_progress_s": r.wait_no_progress_s,
                 "head_pin_pieces": r.head_pin_pieces, "head_pin_present": r.head_pin_present, "head_pin_blocks_total": r.head_pin_blocks_total, "head_pin_blocks_done": r.head_pin_blocks_done,

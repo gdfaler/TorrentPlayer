@@ -25,7 +25,8 @@ struct WaitInfo {
   WaitKind kind = WaitKind::None;
   std::int64_t offset = -1;                     // file offset of the blocked read (-1: no read is blocked)
   int piece = -1;                               // piece needed next (-1: none)
-  int blocks_total = 0, blocks_done = 0, blocks_writing = 0, blocks_requested = 0;
+  int blocks_total = 0, blocks_done = 0, blocks_writing = 0, blocks_requested = 0;   // REAL data blocks only (BEP 47 padding blocks are excluded)
+  int blocks_pad = 0;                           // blocks of the piece that are entirely padding (never downloaded)
   bool in_queue = false;                        // libtorrent has the piece in its download queue
   int priority = -1, deadline_ms = -1;          // libtorrent priority 0..7; deadline we asked for (-1: none)
   int peers_total = 0, peers_with_piece = 0, peers_requesting = 0, web_requesting = 0;

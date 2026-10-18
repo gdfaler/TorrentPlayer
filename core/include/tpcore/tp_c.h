@@ -95,7 +95,8 @@ typedef struct {
   int wait_piece;                     /* piece needed next; -1 none */
   int wait_piece_priority;            /* libtorrent priority 0..7; -1 unknown */
   int wait_piece_deadline_ms;         /* deadline TorrentPlayer asked for; -1 none */
-  int wait_blocks_total, wait_blocks_done, wait_blocks_writing, wait_blocks_requested;
+  int wait_blocks_total, wait_blocks_done, wait_blocks_writing, wait_blocks_requested;   /* REAL data blocks only */
+  int wait_blocks_pad;                /* blocks of that piece that are entirely BEP 47 padding (never downloaded) */
   int wait_in_queue;                  /* 1 if libtorrent has the piece in its download queue */
   int wait_peers_total;               /* connected non-web peers */
   int wait_peers_with_piece;          /* of those, peers whose bitfield has the needed piece */
@@ -106,6 +107,7 @@ typedef struct {
   int head_pin_blocks_total, head_pin_blocks_done, tail_pin_blocks_total, tail_pin_blocks_done;
   int web_seed_errors, web_disconnects, request_drops, block_timeouts;
   char web_seed_last_error[96];
+  int64_t hash_incomplete;            /* verification attempts that found real data missing (not a SHA-1 mismatch) */
 } tp_stream_status;
 void tp_stream_status_get(tp_stream*, tp_stream_status* out);
 
