@@ -239,6 +239,15 @@ void tp_stream_status_get(tp_stream* s, tp_stream_status* o) {
     o->seconds_without_peers = st.seconds_without_peers; o->web_seed_active = st.web_seed_active ? 1 : 0;
     const auto& r = s->s->recovery_report();
     o->recovery_verified = r.verified_present; o->recovery_deleted_partial = r.deleted_partial; o->recovery_deleted_corrupt = r.deleted_corrupt; o->recovery_trimmed = r.trimmed;
+    const auto& w = st.wait;
+    o->wait_kind = static_cast<int>(w.kind); o->wait_offset = w.offset; o->wait_piece = w.piece; o->wait_piece_priority = w.priority; o->wait_piece_deadline_ms = w.deadline_ms;
+    o->wait_blocks_total = w.blocks_total; o->wait_blocks_done = w.blocks_done; o->wait_blocks_writing = w.blocks_writing; o->wait_blocks_requested = w.blocks_requested;
+    o->wait_in_queue = w.in_queue ? 1 : 0; o->wait_peers_total = w.peers_total; o->wait_peers_with_piece = w.peers_with_piece; o->wait_peers_requesting = w.peers_requesting;
+    o->wait_web_requesting = w.web_requesting; o->wait_no_progress_s = w.no_progress_s;
+    o->head_pin_pieces = w.head_pin_pieces; o->head_pin_present = w.head_pin_present; o->tail_pin_pieces = w.tail_pin_pieces; o->tail_pin_present = w.tail_pin_present;
+    o->head_pin_blocks_total = w.head_pin_blocks_total; o->head_pin_blocks_done = w.head_pin_blocks_done; o->tail_pin_blocks_total = w.tail_pin_blocks_total; o->tail_pin_blocks_done = w.tail_pin_blocks_done;
+    o->web_seed_errors = st.web_seed_errors; o->web_disconnects = st.web_disconnects; o->request_drops = st.request_drops; o->block_timeouts = st.block_timeouts;
+    put(o->web_seed_last_error, sizeof o->web_seed_last_error, st.web_seed_last_error);
   } catch (...) { o->state = TP_STATE_ERROR; put(o->state_text, sizeof o->state_text, "Error"); }
 }
 

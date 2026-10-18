@@ -17,9 +17,13 @@ final class OverlayPanel: NSPanel {
 final class BannerView: NSView {
     let title = NSTextField(labelWithString: "")
     let detail = NSTextField(labelWithString: "")
+    let note = NSTextField(wrappingLabelWithString: "")
     let spinner = NSProgressIndicator()
+    let bar = NSProgressIndicator()
     let retryButton = NSButton(title: "Retry", target: nil, action: nil)
+    let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
     var onRetry: (() -> Void)?
+    var onCancel: (() -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -28,30 +32,50 @@ final class BannerView: NSView {
         layer?.cornerRadius = 14
         title.font = .systemFont(ofSize: 17, weight: .semibold); title.textColor = .white; title.alignment = .center; title.lineBreakMode = .byTruncatingTail
         detail.font = .systemFont(ofSize: 12); detail.textColor = NSColor(white: 1, alpha: 0.78); detail.alignment = .center; detail.lineBreakMode = .byTruncatingTail
+        note.font = .systemFont(ofSize: 11); note.textColor = NSColor(white: 1, alpha: 0.6); note.alignment = .center; note.maximumNumberOfLines = 3
         spinner.style = .spinning; spinner.controlSize = .regular; spinner.isIndeterminate = true; spinner.appearance = NSAppearance(named: .darkAqua)
+        bar.style = .bar; bar.controlSize = .small; bar.isIndeterminate = false; bar.minValue = 0; bar.maxValue = 1; bar.appearance = NSAppearance(named: .darkAqua); bar.isHidden = true
         retryButton.bezelStyle = .rounded; retryButton.target = self; retryButton.action = #selector(retryTapped); retryButton.isHidden = true
-        [spinner, title, detail, retryButton].forEach { addSubview($0) }
+        cancelButton.bezelStyle = .rounded; cancelButton.target = self; cancelButton.action = #selector(cancelTapped); cancelButton.isHidden = true
+        cancelButton.setAccessibilityLabel("Cancel and go back to the file list")
+        [spinner, title, detail, note, bar, retryButton, cancelButton].forEach { addSubview($0) }
     }
     required init?(coder: NSCoder) { fatalError() }
     @objc func retryTapped() { onRetry?() }
+    @objc func cancelTapped() { onCancel?() }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     /// Returns the size the panel needs for this content.
-    func set(title t: String, detail d: String, spinning: Bool, retry: Bool) -> NSSize {
-        title.stringValue = t; detail.stringValue = d
-        retryButton.isHidden = !retry
+    func set(title t: String, detail d: String, spinning: Bool, retry: Bool, note n: String = "", progress: Double? = nil, cancel: Bool = false) -> NSSize {
+        title.stringValue = t; detail.stringValue = d; note.stringValue = n
+        retryButton.isHidden = !retry; cancelButton.isHidden = !cancel
         if spinning { spinner.isHidden = false; spinner.startAnimation(nil) } else { spinner.isHidden = true; spinner.stopAnimation(nil) }
-        let w = min(560, max(280, max(title.intrinsicContentSize.width, detail.intrinsicContentSize.width) + 56))
+        if let p = progress { bar.isHidden = false; bar.doubleValue = p } else { bar.isHidden = true }
+        let w = min(560, max(300, max(title.intrinsicContentSize.width, detail.intrinsicContentSize.width) + 56))
+        var noteH: CGFloat = 0
+        if !n.isEmpty {
+            note.preferredMaxLayoutWidth = w - 32
+            noteH = min(48, ceil((n as NSString).boundingRect(with: NSSize(width: w - 32, height: 200), options: [.usesLineFragmentOrigin], attributes: [.font: note.font as Any]).height) + 4)
+        }
         var h: CGFloat = 20 + 22 + 6 + 16 + 18
         if spinning { h += 36 }
-        if retry { h += 34 }
+        if progress != nil { h += 14 }
+        if !n.isEmpty { h += noteH + 4 }
+        if retry || cancel { h += 34 }
         let size = NSSize(width: w, height: h)
         setFrameSize(size)
         var y = size.height - 18
         if spinning { y -= 28; spinner.frame = NSRect(x: (w - 28) / 2, y: y, width: 28, height: 28); y -= 8 }
         y -= 22; title.frame = NSRect(x: 16, y: y, width: w - 32, height: 22)
         y -= 20; detail.frame = NSRect(x: 16, y: y, width: w - 32, height: 16)
-        if retry { retryButton.frame = NSRect(x: (w - 90) / 2, y: 12, width: 90, height: 26) }
+        if progress != nil { y -= 14; bar.frame = NSRect(x: 24, y: y + 2, width: w - 48, height: 10) }
+        if !n.isEmpty { y -= noteH + 4; note.frame = NSRect(x: 16, y: y, width: w - 32, height: noteH) }
+        let buttons = [retry ? retryButton : nil, cancel ? cancelButton : nil].compactMap { $0 }
+        if !buttons.isEmpty {
+            let total = CGFloat(buttons.count) * 90 + CGFloat(buttons.count - 1) * 10
+            var x = (w - total) / 2
+            for b in buttons { b.frame = NSRect(x: x, y: 12, width: 90, height: 26); x += 100 }
+        }
         return size
     }
 }

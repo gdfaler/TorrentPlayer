@@ -13,8 +13,6 @@ struct PlayerSettings {
     var mute = false
 }
 
-struct BannerContent { var title: String; var detail: String; var spinning: Bool; var retry: Bool }
-
 protocol PlayerSessionDelegate: AnyObject {
     func playerSessionDidEnd(_ s: PlayerSession, reason: String)
 }
@@ -61,6 +59,7 @@ final class PlayerSession: NSObject {
         self.engine = engine; self.meta = meta; self.fileIndex = fileIndex; self.settings = settings; self.displayName = displayName; self.telemetry = telemetry
         super.init()
         bannerView.onRetry = { [weak self] in self?.retry() }
+        bannerView.onCancel = { [weak self] in self?.cancel() }
         banner.contentView = bannerView
         controlsPanel.contentView = controlsView
         controlsView.onPlayPause = { [weak self] in self?.togglePause() }
@@ -257,6 +256,15 @@ final class PlayerSession: NSObject {
     func toggleMute() { cmd(["cycle", "mute"]) }
     func toggleFullScreen() { mpvWindow?.toggleFullScreen(nil) }
 
+    /// User cancelled a start that has not produced playback: tear the session down (same safe order as any end) and return to the file list.
+    func cancel() {
+        guard !ending else { return }
+        var f: [String: Any] = ["since_open_s": since(), "playback_started": playbackStarted]
+        if let s = stream { f.merge(WaitText.fields(s.status().raw)) { a, _ in a } }
+        telemetry.emit("cancel_requested", f)
+        end(reason: "cancelled by user")
+    }
+
     func retry() {
         telemetry.emit("retry_requested", ["error": mpvError ?? ""])
         end(reason: "retry")
@@ -287,7 +295,11 @@ final class PlayerSession: NSObject {
             default: return BannerContent(title: "Buffering…", detail: "\(prefix)\(aheadText) · \(peers) · \(rate)", spinning: true, retry: false)
             }
         }
-        if !playbackStarted { return waiting("") }
+        if !playbackStarted {
+            var c = WaitText.beforePlayback(raw, fileSize: s.size, rate: rate, aheadText: aheadText) ?? waiting("")
+            c.cancel = !c.retry                               // a Cancel button for every wait before playback has started
+            return c
+        }
         if let r = seekPending {
             let age = telemetry.now - r.issued
             let to = ControlsView.format(r.target)
@@ -317,12 +329,14 @@ final class PlayerSession: NSObject {
         // banner
         let content = composeBanner()
         let bannerKey = content.map { $0.title + (retryShownKey($0)) } ?? ""
-        if bannerKey != lastBannerKey {
-            lastBannerKey = bannerKey
-            telemetry.emit("ui_banner", ["title": content?.title ?? "(hidden)", "detail": content?.detail ?? "", "retry_button": content?.retry ?? false, "playing": playbackStarted])
+        let nowT = telemetry.now
+        if bannerKey != lastBannerKey || (content != nil && nowT - lastBannerEmit >= 5.0) {
+            lastBannerKey = bannerKey; lastBannerEmit = nowT
+            telemetry.emit("ui_banner", ["title": content?.title ?? "(hidden)", "detail": content?.detail ?? "", "note": content?.note ?? "", "progress": content?.progress ?? -1,
+                                         "retry_button": content?.retry ?? false, "cancel_button": content?.cancel ?? false, "playing": playbackStarted])
         }
         if let c = content {
-            let size = bannerView.set(title: c.title, detail: c.detail, spinning: c.spinning, retry: c.retry)
+            let size = bannerView.set(title: c.title, detail: c.detail, spinning: c.spinning, retry: c.retry, note: c.note, progress: c.progress, cancel: c.cancel)
             banner.setContentSize(size)
             positionOverlays()
             if !banner.isVisible, let w = mpvWindow { if banner.parent == nil { w.addChildWindow(banner, ordered: .above) }; banner.orderFront(nil) }
@@ -340,7 +354,7 @@ final class PlayerSession: NSObject {
         if let s = stream, tick % 4 == 0 { let st = s.status().raw; if Int(st.hash_failures) != lastHashFailures { lastHashFailures = Int(st.hash_failures)
             telemetry.emit("hash_failure", ["total": lastHashFailures, "storage": st.hash_storage, "arrived": st.hash_arrived, "undetermined": st.hash_undetermined, "report": s.lastHashReport()]) } }
     }
-    private var tick = 0, bannerShown = false, lastHashFailures = 0, lastBannerKey = ""
+    private var tick = 0, bannerShown = false, lastHashFailures = 0, lastBannerKey = "", lastBannerEmit = -100.0, lastWaitSnapshot = -100.0
     private func retryShownKey(_ c: BannerContent) -> String { c.retry ? "|retry" : "" }
 
     private func attach(to w: NSWindow) {
@@ -402,7 +416,14 @@ final class PlayerSession: NSObject {
             "ahead_bytes": r.contiguous_ahead_bytes, "ahead_s": bitrate > 0 ? Double(r.contiguous_ahead_bytes) / bitrate : -1, "blocked_readers": r.blocked_readers,
             "cache_charged": r.cache_charged, "cache_limit": r.cache_limit, "pieces_present": r.pieces_present, "pieces_verified": r.pieces_verified,
             "hash_failures": r.hash_failures, "un_have_resets": r.un_have_resets, "watchdog_kicks": r.watchdog_kicks, "cap_violations": r.cap_violations,
-            "time_pos_s": timePos, "paused": paused, "paused_for_cache": pausedForCache, "seeking": seekPending != nil, "peer_bytes": r.peer_bytes, "web_bytes": r.web_bytes])
+            "time_pos_s": timePos, "paused": paused, "paused_for_cache": pausedForCache, "seeking": seekPending != nil, "peer_bytes": r.peer_bytes, "web_bytes": r.web_bytes]
+            .merging(WaitText.fields(r)) { a, _ in a })
+        // a prolonged wait for one piece is recorded with the core's own event log and the last web-seed error (facts for diagnosis; no conclusion is drawn here)
+        if r.wait_no_progress_s >= WaitText.slowAfter && telemetry.now - lastWaitSnapshot >= 60.0 {
+            lastWaitSnapshot = telemetry.now
+            telemetry.emit("wait_prolonged", WaitText.fields(r).merging(["state": st.stateName, "web_seed_last_error": st.webSeedLastError,
+                                                                          "core_events_tail": String(s.events().suffix(4000))]) { a, _ in a })
+        }
     }
 
     /// The core's state names describe connectivity ("No peers found") even when nothing is waiting for data. For analysis the telemetry therefore also carries a
@@ -431,7 +452,10 @@ final class PlayerSession: NSObject {
             case 124: self.seekRelative(shift ? 30 : 5); return nil       // right
             case 126: self.adjustVolume(5); return nil                     // up
             case 125: self.adjustVolume(-5); return nil                    // down
-            case 53: if self.mpvWindow?.styleMask.contains(.fullScreen) == true { self.toggleFullScreen(); return nil }; return e   // escape
+            case 53:                                                       // escape: leave full screen; before playback has started it cancels the start
+                if self.mpvWindow?.styleMask.contains(.fullScreen) == true { self.toggleFullScreen(); return nil }
+                if !self.playbackStarted && self.mpvError == nil && self.mpvWindow != nil { self.cancel(); return nil }
+                return e
             default: break
             }
             switch e.charactersIgnoringModifiers?.lowercased() {

@@ -74,6 +74,7 @@ struct StreamStatus {
     var raw: tp_stream_status
     var state: Int { Int(raw.state) }
     var stateName: String { withUnsafePointer(to: raw.state_text) { $0.withMemoryRebound(to: CChar.self, capacity: 64) { String(cString: $0) } } }
+    var webSeedLastError: String { withUnsafePointer(to: raw.web_seed_last_error) { $0.withMemoryRebound(to: CChar.self, capacity: 96) { String(cString: $0) } } }
 }
 
 final class TPStream {

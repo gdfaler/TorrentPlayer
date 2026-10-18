@@ -82,4 +82,33 @@ class PlayheadEstimator {
   std::int64_t file_size_, zone_, follow_, off_ = 0;
 };
 
+// ---- startup diagnostics helpers (pure, unit-tested)
+// What kind of data is the reader waiting for? Container metadata lives in the pinned head/tail pieces (an MP4/MOV without "faststart" keeps its index at the END).
+enum class WaitKind { None = 0, HeadIndex = 1, TailIndex = 2, Data = 3 };
+inline WaitKind classify_wait_piece(int piece, int head_first, int head_last, int tail_first, int tail_last) {
+  if (piece < 0) return WaitKind::None;
+  if (piece >= head_first && piece <= head_last) return WaitKind::HeadIndex;
+  if (piece >= tail_first && piece <= tail_last) return WaitKind::TailIndex;
+  return WaitKind::Data;
+}
+// Number of 16 KiB blocks in a piece of `piece_bytes` bytes (the last piece of a torrent is shorter).
+inline int blocks_in_piece(std::int64_t piece_bytes, int block_size = 16384) {
+  return piece_bytes <= 0 ? 0 : static_cast<int>((piece_bytes + block_size - 1) / block_size);
+}
+// Tracks how long the piece the reader needs has made no progress. `progress` is any measure that only grows while data for the target arrives
+// (finished blocks). Changing the target restarts the clock. It states a fact (seconds without a new block); it never decides that data is unavailable.
+class ProgressWatch {
+ public:
+  void update(double now, int target, std::int64_t progress) {
+    if (!init_ || target != target_) { init_ = true; target_ = target; last_ = progress; since_ = now; }
+    else if (progress > last_) { last_ = progress; since_ = now; }
+  }
+  double idle_seconds(double now) const { return init_ ? now - since_ : 0.0; }
+ private:
+  bool init_ = false;
+  int target_ = -1;
+  std::int64_t last_ = 0;
+  double since_ = 0;
+};
+
 }  // namespace tp

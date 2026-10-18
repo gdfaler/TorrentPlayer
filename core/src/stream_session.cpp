@@ -136,13 +136,16 @@ std::int64_t StreamSession::read(std::int64_t off, void* buf, std::int64_t len, 
     store_->touch(piece);
     if (!store_->has(piece)) {
       ++blocked_;
+      blocked_offset_ = off;
       demand_piece_ = piece;
+      if (blocked_logged_.fetch_add(1) < 30) log_event("read blocked: file offset " + std::to_string(off) + " needs piece " + std::to_string(piece) + " (len " + std::to_string(len) + ")");
       bool ok = false;
       while (!stop_.load()) {
         if (store_->wait_present(piece, std::chrono::milliseconds(100), cancel)) { ok = true; break; }
         if (cancel && cancel->load()) break;
       }
       --blocked_;
+      blocked_offset_ = -1;
       if (!ok) return -1;
       demand_piece_ = -1;
     }
@@ -170,7 +173,32 @@ void StreamSession::on_alert(lt::alert* a) {
     ++bans_; log_event("PEER BAN: " + pb->message());
   } else if (auto* te = lt::alert_cast<lt::torrent_error_alert>(a)) {
     log_event("TORRENT ERROR: " + te->message());
+  } else if (auto* us = lt::alert_cast<lt::url_seed_alert>(a)) {                  // a web seed failed or is not usable
+    const int n = ++web_alerts_;
+    { std::lock_guard<std::mutex> g(diag_mu_); web_last_error_ = us->message(); }
+    if (n <= 20) log_event("WEB SEED ALERT: " + us->message());
+  } else if (auto* pe = lt::alert_cast<lt::peer_error_alert>(a)) {
+    if (is_web_endpoint(pe->endpoint)) {
+      const int n = ++web_alerts_;
+      { std::lock_guard<std::mutex> g(diag_mu_); web_last_error_ = pe->message(); }
+      if (n <= 20) log_event("WEB SEED PEER ERROR: " + pe->message());
+    }
+  } else if (auto* pd = lt::alert_cast<lt::peer_disconnected_alert>(a)) {
+    if (is_web_endpoint(pd->endpoint)) {
+      const int n = ++web_disconnects_;
+      { std::lock_guard<std::mutex> g(diag_mu_); web_last_error_ = pd->message(); }
+      if (n <= 20) log_event("WEB SEED DISCONNECT: " + pd->message());
+    }
+  } else if (lt::alert_cast<lt::request_dropped_alert>(a)) {
+    ++request_drops_;
+  } else if (lt::alert_cast<lt::block_timeout_alert>(a)) {
+    ++block_timeouts_;
   }
+}
+
+bool StreamSession::is_web_endpoint(const lt::tcp::endpoint& ep) {
+  std::lock_guard<std::mutex> g(ips_mu_);
+  return std::find(web_ips_.begin(), web_ips_.end(), ep.address().to_string()) != web_ips_.end();
 }
 
 // ============================================================== scheduler
@@ -211,6 +239,64 @@ void StreamSession::update_traffic_split() {
   for (auto& ip : ips) if (std::find(web_ips_.begin(), web_ips_.end(), ip) == web_ips_.end()) web_ips_.push_back(ip);
 }
 
+// ~1 Hz: what is the reader waiting for, how far has that piece got, and who could supply it. Read-only with respect to scheduling (no priority or deadline is changed here).
+void StreamSession::update_wait_info(double t) {
+  WaitInfo w;
+  int ha, hb, ta, tb;
+  { std::lock_guard<std::mutex> g(cfg_mu_); ha = planner_.pin_head_first(); hb = planner_.pin_head_last(); ta = planner_.pin_tail_first(); tb = planner_.pin_tail_last(); }
+  std::vector<lt::partial_piece_info> q;
+  try { q = h_.get_download_queue(); } catch (std::exception const&) {}
+  auto blocks_of = [&](int p, int& total, int& done, int& writing, int& requested, bool& inq) {
+    total = blocks_in_piece(ti_->piece_size(lt::piece_index_t(p)));
+    done = writing = requested = 0; inq = false;
+    if (store_->has(p)) { done = total; return; }
+    for (auto const& pp : q) if (static_cast<int>(pp.piece_index) == p) { done = pp.finished; writing = pp.writing; requested = pp.requested; inq = true; break; }
+  };
+  auto pin = [&](int a, int b, int& np, int& present, int& bt, int& bd) {
+    np = std::max(0, b - a + 1); present = bt = bd = 0;
+    for (int p = a; p <= b; ++p) { int t_, d_, w_, r_; bool iq; blocks_of(p, t_, d_, w_, r_, iq); bt += t_; bd += d_; present += store_->has(p) ? 1 : 0; }
+  };
+  pin(ha, hb, w.head_pin_pieces, w.head_pin_present, w.head_pin_blocks_total, w.head_pin_blocks_done);
+  pin(ta, tb, w.tail_pin_pieces, w.tail_pin_present, w.tail_pin_blocks_total, w.tail_pin_blocks_done);
+
+  const bool blocked = blocked_.load() > 0;
+  const int dm = demand_piece_.load();
+  int need = -1;
+  if (blocked && dm >= 0) need = dm;
+  else {
+    for (int p = ha; p <= hb && need < 0; ++p) if (!store_->has(p)) need = p;
+    for (int p = ta; p <= tb && need < 0; ++p) if (!store_->has(p)) need = p;
+  }
+  w.offset = blocked ? blocked_offset_.load() : -1;
+  w.piece = need;
+  w.kind = classify_wait_piece(need, ha, hb, ta, tb);
+  if (need >= 0) {
+    blocks_of(need, w.blocks_total, w.blocks_done, w.blocks_writing, w.blocks_requested, w.in_queue);
+    try { w.priority = static_cast<int>(static_cast<std::uint8_t>(h_.piece_priority(lt::piece_index_t(need)))); } catch (...) { w.priority = -1; }
+    auto it = deadlines_applied_.find(need);
+    w.deadline_ms = it == deadlines_applied_.end() ? -1 : it->second;
+  }
+  std::vector<lt::peer_info> pi;
+  try { h_.get_peer_info(pi); } catch (std::exception const&) {}
+  for (auto const& x : pi) {
+    if (x.connection_type == lt::peer_info::web_seed) { if (x.download_queue_length > 0) ++w.web_requesting; continue; }
+    ++w.peers_total;
+    if (need >= 0 && static_cast<int>(x.pieces.size()) > need && x.pieces.get_bit(lt::piece_index_t(need))) ++w.peers_with_piece;
+    if (x.download_queue_length > 0) ++w.peers_requesting;
+  }
+  watch_.update(t, need, w.blocks_done);
+  w.no_progress_s = (blocked && need >= 0) ? watch_.idle_seconds(t) : 0.0;
+  if (w.no_progress_s < 5.0) idle_logged_ = false;
+  else if (w.no_progress_s >= 20.0 && !idle_logged_) {
+    idle_logged_ = true;
+    log_event("no new block for piece " + std::to_string(need) + " for " + std::to_string(static_cast<int>(w.no_progress_s)) + " s: blocks " + std::to_string(w.blocks_done) + "/" +
+              std::to_string(w.blocks_total) + " (writing " + std::to_string(w.blocks_writing) + ", requested " + std::to_string(w.blocks_requested) + "), in queue " + (w.in_queue ? "yes" : "no") +
+              ", peers having it " + std::to_string(w.peers_with_piece) + "/" + std::to_string(w.peers_total) + ", peers with open requests " + std::to_string(w.peers_requesting) +
+              ", web seeds with open requests " + std::to_string(w.web_requesting) + ", priority " + std::to_string(w.priority) + ", deadline " + std::to_string(w.deadline_ms) + " ms");
+  }
+  wait_cache_ = w;
+}
+
 void StreamSession::apply_priorities(const WindowPlan& plan, int dm) {
   std::vector<lt::download_priority_t> prio(static_cast<std::size_t>(num_pieces_), lt::download_priority_t{0});
   for (int p = plan.head; p < plan.hi_wanted; ++p) prio[static_cast<std::size_t>(p)] = lt::download_priority_t{7};
@@ -219,12 +305,14 @@ void StreamSession::apply_priorities(const WindowPlan& plan, int dm) {
   for (int p = pc; p <= pd; ++p) if (!store_->has(p)) prio[static_cast<std::size_t>(p)] = lt::download_priority_t{7};
   if (dm >= 0 && dm < num_pieces_ && !store_->has(dm)) prio[static_cast<std::size_t>(dm)] = lt::download_priority_t{7};
   h_.prioritize_pieces(prio);
+  deadlines_applied_.clear();                                        // diagnostics only: what we asked libtorrent for
+  auto set_dl = [&](int p, int ms) { h_.set_piece_deadline(lt::piece_index_t(p), ms); deadlines_applied_[p] = ms; };
   int k = 0;
-  for (int p = plan.head; p < plan.hi_wanted; ++p) if (!store_->has(p)) h_.set_piece_deadline(lt::piece_index_t(p), 200 + (k++) * 120);
+  for (int p = plan.head; p < plan.hi_wanted; ++p) if (!store_->has(p)) set_dl(p, 200 + (k++) * 120);
   int j = 0;
-  for (int p = pa; p <= pb; ++p) if (!store_->has(p)) h_.set_piece_deadline(lt::piece_index_t(p), 10 + (j++) * 20);
-  for (int p = pc; p <= pd; ++p) if (!store_->has(p)) h_.set_piece_deadline(lt::piece_index_t(p), 10 + (j++) * 20);
-  if (dm >= 0 && dm < num_pieces_ && !store_->has(dm)) h_.set_piece_deadline(lt::piece_index_t(dm), 0);
+  for (int p = pa; p <= pb; ++p) if (!store_->has(p)) set_dl(p, 10 + (j++) * 20);
+  for (int p = pc; p <= pd; ++p) if (!store_->has(p)) set_dl(p, 10 + (j++) * 20);
+  if (dm >= 0 && dm < num_pieces_ && !store_->has(dm)) set_dl(dm, 0);
 }
 
 // Peer-starvation watchdog (verified remedy order, research phase): re-dial known peers first; if there is still nobody after a few
@@ -297,7 +385,11 @@ StreamState StreamSession::compute_state(const lt::torrent_status& st, int block
     if (secs(Clock::now() - last_data_) > 20.0) return StreamState::Stalled;
     bool pins_missing = false;
     for (int p = planner_.pin_head_first(); p <= planner_.pin_head_last(); ++p) if (!store_->has(p)) pins_missing = true;
-    return (pins_missing && secs(Clock::now() - t0_) < 60.0) ? StreamState::Preparing : StreamState::Buffering;
+    // The reader is waiting for container metadata when the piece it needs is a pinned head or tail piece (an MP4/MOV without "faststart"
+    // keeps its index at the END of the file). That is "Preparing", however long it takes; it is not ordinary playback buffering.
+    const WaitKind wk = classify_wait_piece(demand_piece_.load(), planner_.pin_head_first(), planner_.pin_head_last(), planner_.pin_tail_first(), planner_.pin_tail_last());
+    const bool waiting_for_index = wk == WaitKind::HeadIndex || wk == WaitKind::TailIndex;
+    return (waiting_for_index || (pins_missing && secs(Clock::now() - t0_) < 60.0)) ? StreamState::Preparing : StreamState::Buffering;
   }
   return StreamState::Ready;
 }
@@ -329,6 +421,7 @@ void StreamSession::tick() {
     }
   }
   if (tick_no % 10 == 5 && s.num_peers > 0) update_known_peers();                 // every second while any peer is connected
+  if (tick_no % 10 == 3 && !checking) { try { update_wait_info(t); } catch (std::exception const& e) { log_event(std::string("wait diagnostics exception: ") + e.what()); } }
 
   // ---- window plan, protection, eviction, reconciliation
   int head; { std::lock_guard<std::mutex> g(est_mu_); head = geo_.piece_of_file_offset(est_.offset()); }
@@ -391,6 +484,9 @@ void StreamSession::tick() {
   const auto& c = shadow_->counters();
   st.hash_failures = c.failures.load(); st.hash_storage = c.storage.load(); st.hash_arrived = c.arrived.load(); st.hash_undetermined = c.undetermined.load(); st.pieces_verified = c.verified_ok.load();
   st.seconds_without_peers = s.num_peers == 0 ? secs(now - last_peer_seen_) : 0.0;
+  st.wait = wait_cache_;
+  st.web_seed_errors = web_alerts_.load(); st.web_disconnects = web_disconnects_.load(); st.request_drops = request_drops_.load(); st.block_timeouts = block_timeouts_.load();
+  { std::lock_guard<std::mutex> dg(diag_mu_); st.web_seed_last_error = web_last_error_; }
   st.state = compute_state(s, st.blocked_readers, st.seconds_without_peers);
   st.detail = to_string(st.state);
   std::lock_guard<std::mutex> g(status_mu_);

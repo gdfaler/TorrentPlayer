@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <map>
 #include <vector>
 #include "tpcore/disk_policy.hpp"
 #include "tpcore/engine.hpp"
@@ -18,6 +19,20 @@ namespace tp {
 
 enum class StreamState { Connecting, NoPeers, Preparing, Buffering, Ready, Stalled, DiskPaused, Error };
 const char* to_string(StreamState s);
+
+// What the player is waiting for right now (startup / buffering diagnostics). Facts only; nothing here decides that data is "unavailable".
+struct WaitInfo {
+  WaitKind kind = WaitKind::None;
+  std::int64_t offset = -1;                     // file offset of the blocked read (-1: no read is blocked)
+  int piece = -1;                               // piece needed next (-1: none)
+  int blocks_total = 0, blocks_done = 0, blocks_writing = 0, blocks_requested = 0;
+  bool in_queue = false;                        // libtorrent has the piece in its download queue
+  int priority = -1, deadline_ms = -1;          // libtorrent priority 0..7; deadline we asked for (-1: none)
+  int peers_total = 0, peers_with_piece = 0, peers_requesting = 0, web_requesting = 0;
+  double no_progress_s = 0;                     // seconds since the needed piece last gained a block (0 when nothing is blocked)
+  int head_pin_pieces = 0, head_pin_present = 0, tail_pin_pieces = 0, tail_pin_present = 0;
+  int head_pin_blocks_total = 0, head_pin_blocks_done = 0, tail_pin_blocks_total = 0, tail_pin_blocks_done = 0;
+};
 
 struct StreamStatus {
   StreamState state = StreamState::Connecting;
@@ -35,6 +50,9 @@ struct StreamStatus {
   int hash_failures = 0, hash_storage = 0, hash_arrived = 0, hash_undetermined = 0, pieces_verified = 0;
   bool web_seed_active = false;
   double seconds_without_peers = 0;
+  WaitInfo wait;
+  int web_seed_errors = 0, web_disconnects = 0, request_drops = 0, block_timeouts = 0;
+  std::string web_seed_last_error;
 };
 
 class StreamSession {
@@ -79,6 +97,8 @@ class StreamSession {
   void on_alert(lt::alert* a);                             // called from the engine alert thread
   void update_known_peers();
   void update_traffic_split();
+  void update_wait_info(double t);                          // ~1 Hz, scheduler thread only
+  bool is_web_endpoint(const lt::tcp::endpoint& ep);
   std::vector<std::int64_t> window_deadlines_;
   Engine& eng_;
   std::shared_ptr<lt::torrent_info> ti_;
@@ -129,6 +149,15 @@ class StreamSession {
   StreamState compute_state(const lt::torrent_status& st, int demand_blocked, double since_peer);
   std::chrono::steady_clock::time_point last_data_;
   std::chrono::steady_clock::time_point last_prio_;
+  // ---- startup diagnostics
+  std::atomic<std::int64_t> blocked_offset_{-1};
+  std::atomic<int> web_alerts_{0}, web_disconnects_{0}, request_drops_{0}, block_timeouts_{0}, blocked_logged_{0};
+  std::mutex diag_mu_;
+  std::string web_last_error_;
+  WaitInfo wait_cache_;                                     // scheduler thread only
+  ProgressWatch watch_;                                     // scheduler thread only
+  bool idle_logged_ = false;
+  std::map<int, int> deadlines_applied_;                    // piece -> deadline (ms) most recently requested; scheduler thread only
 };
 
 }  // namespace tp
