@@ -20,12 +20,14 @@ struct AppOptions {
     var behindSeconds: Double?, aheadSeconds: Double?
     var startTimeoutGiven = false
     var startTimeout = 300.0                // --start-timeout S: end an autotest if playback never starts
+    var openScript: [(after: Double, path: String)] = []   // --open-script "6:/path/b.mkv": N seconds after playback starts, open another item (acceptance runs of source switching)
+    var autotestMode: Bool { exitAfter != nil || !seekScript.isEmpty || startTimeoutGiven || !openScript.isEmpty }
 }
 
 final class DropView: NSView {
-    var onTorrentFile: ((String) -> Void)?
+    var onFiles: (([String]) -> Void)?                // dropped files, in the order macOS provides them
     var onMagnet: ((String) -> Void)?
-    let label = NSTextField(labelWithString: "Drop a .torrent file or a magnet link here")
+    let label = NSTextField(labelWithString: "Drop a video, a .torrent file or a magnet link here")
     private var hover = false { didSet { needsDisplay = true } }
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -46,9 +48,10 @@ final class DropView: NSView {
     override func performDragOperation(_ s: NSDraggingInfo) -> Bool {
         hover = false
         let pb = s.draggingPasteboard
-        if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], let u = urls.first {
-            if u.isFileURL { onTorrentFile?(u.path); return true }
-            if u.scheme == "magnet" { onMagnet?(u.absoluteString); return true }
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
+            let files = urls.filter { $0.isFileURL }.map { $0.path }
+            if !files.isEmpty { onFiles?(files); return true }
+            if let u = urls.first, u.scheme == "magnet" { onMagnet?(u.absoluteString); return true }
         }
         if let str = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), str.hasPrefix("magnet:?") { onMagnet?(str); return true }
         return false
@@ -68,12 +71,15 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     var settings = PlayerSettings()
     var autotestStartedAt: Date?
     var autotestSeeksDone = 0
+    var autotestOpensDone = 0
     var autotestTimer: Timer?
     var lastSeedAction: Double = 0
     var metaTimer: Timer?
     var fetchStartedAt = Date()
     var openedSource = ""
     var lastLauncherTitle = ""
+    var failureTitle = "Could not open this torrent"
+    var switcher = SwitchCoordinator()
 
     // UI
     let window: NSWindow
@@ -87,7 +93,7 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     let scroll = NSScrollView()
     let playButton = NSButton(title: "Play", target: nil, action: nil)
     let retryButton = NSButton(title: "Try again", target: nil, action: nil)
-    var openButton = NSButton(title: "Open Torrent…", target: nil, action: nil)
+    var openButton = NSButton(title: "Open…", target: nil, action: nil)
 
     init(options: AppOptions) {
         self.options = options
@@ -116,9 +122,9 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     func buildUI() {
         window.title = "TorrentPlayer — Open"; window.isReleasedWhenClosed = false
         let content = window.contentView!
-        drop.onTorrentFile = { [weak self] p in self?.openTorrentFile(p) }
+        drop.onFiles = { [weak self] files in self?.open(requests: files) }
         drop.onMagnet = { [weak self] m in self?.openMagnet(m) }
-        openButton.target = self; openButton.action = #selector(chooseTorrent); openButton.bezelStyle = .rounded
+        openButton.target = self; openButton.action = #selector(chooseFile); openButton.bezelStyle = .rounded
         let pasteButton = NSButton(title: "Paste Magnet Link", target: self, action: #selector(pasteMagnet)); pasteButton.bezelStyle = .rounded
         magnetField.placeholderString = "magnet:?xt=urn:btih:…"; magnetField.delegate = self; magnetField.target = self; magnetField.action = #selector(magnetEntered)
         let goButton = NSButton(title: "Open", target: self, action: #selector(magnetEntered)); goButton.bezelStyle = .rounded
@@ -161,7 +167,7 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         var title = "", detail = ""
         var cancelShown = false, retryShown = false
         switch phase {
-        case .idle: busy = false; showList = false; title = "Open a torrent to start streaming"; detail = "Nothing is downloaded to your Downloads folder in streaming mode: the cache is bounded and reclaimed automatically."
+        case .idle: busy = false; showList = false; title = "Open a video or a torrent to start"; detail = "Local videos play straight from disk. Torrents stream: nothing is downloaded to your Downloads folder, the cache is bounded and reclaimed automatically."
         case .fetching:
             busy = true; showList = false; cancelShown = true
             let st = meta?.status(); let p = st?.peers ?? 0; let e = st?.elapsed ?? 0
@@ -173,7 +179,7 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         case .choosing: busy = false; showList = true; title = meta?.name ?? "Choose a file"
             detail = files.contains(where: { $0.isVideo }) ? "Choose a video file and press Play." : "No playable video found in this torrent. The files are listed below."
         case .playing: busy = false; showList = false; title = "Playing"; detail = ""
-        case .failed(let m): busy = false; showList = false; title = "Could not open this torrent"; detail = m; retryShown = true
+        case .failed(let m): busy = false; showList = false; title = failureTitle; detail = m; retryShown = true
         }
         if title != lastLauncherTitle { lastLauncherTitle = title; telemetry.emit("ui_launcher", ["title": title, "detail": detail]) }
         statusLabel.stringValue = title; detailLabel.stringValue = detail
@@ -183,9 +189,10 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     }
 
     // MARK: actions
-    @objc func chooseTorrent() {
-        let p = NSOpenPanel(); p.allowedContentTypes = [UTType(filenameExtension: "torrent") ?? .data]; p.allowsMultipleSelection = false; p.canChooseDirectories = false
-        p.beginSheetModal(for: window) { [weak self] r in if r == .OK, let u = p.url { self?.openTorrentFile(u.path) } }
+    @objc func chooseFile() {
+        window.makeKeyAndOrderFront(nil)
+        let p = NSOpenPanel(); p.allowedContentTypes = OpenClassifier.panelContentTypes; p.allowsMultipleSelection = false; p.canChooseDirectories = false
+        p.beginSheetModal(for: window) { [weak self] r in if r == .OK, let u = p.url { self?.open(requests: [u.path]) } }
     }
     @objc func pasteMagnet() { if let s = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) { magnetField.stringValue = s; openMagnet(s) } }
     @objc func magnetEntered() { openMagnet(magnetField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) }
@@ -193,8 +200,49 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     @objc func retryOpen() { if !openedSource.isEmpty { open(source: openedSource) } else { phase = .idle } }
     @objc func playSelected() { let r = table.selectedRow; guard r >= 0, r < files.count else { return }; startPlayback(file: files[r]) }
 
-    func open(source: String) {
-        if source.hasPrefix("magnet:") { openMagnet(source) } else { openTorrentFile(source) }
+    func open(source: String) { open(requests: [source]) }
+
+    /// The one entry for every open request (menu, button, drop, Finder, Dock, --open): classify, keep the first openable item, then start it
+    /// (replacing a running playback only after that session's asynchronous teardown).
+    func open(requests: [String]) {
+        guard let target = OpenClassifier.first(of: requests) else { return }
+        switch target {
+        case .unsupported(let why), .missing(let why):
+            telemetry.emit("open_failed", ["source": "request", "message": why])
+            if session != nil { NSSound.beep(); return }                              // keep playing: a bad request must not stop the current video
+            openedSource = requests.first ?? ""; failureTitle = "Could not open this file"
+            window.makeKeyAndOrderFront(nil); phase = .failed(why)
+        case .torrentFile, .magnet, .localVideo:
+            switch switcher.request(target, hasSession: session != nil, sessionEnding: session?.isEnding ?? false) {
+            case .startNow(let t): begin(t)
+            case .endCurrentThenStart: telemetry.emit("session_replace", ["reason": "new item opened"]); session?.end(reason: "replaced by a new item")
+            case .waitForTeardown: break
+            }
+        }
+    }
+
+    /// Starts an item. Only ever called when no session exists.
+    func begin(_ t: OpenTarget) {
+        switch t {
+        case .torrentFile(let p): failureTitle = "Could not open this torrent"; openTorrentFile(p)
+        case .magnet(let m): failureTitle = "Could not open this torrent"; openMagnet(m)
+        case .localVideo(let p): startLocal(path: p)
+        case .unsupported, .missing: break
+        }
+    }
+
+    func startLocal(path: String) {
+        if case .fetching = phase { cancelFetch() }
+        openedSource = path; failureTitle = "Could not open this file"
+        var facts = OpenClassifier.telemetryFacts(path: path); facts["source"] = "local_file"
+        telemetry.emit("open_local", facts)                                            // extension and size only
+        let s = PlayerSession(localFile: path, settings: settings, telemetry: telemetry)
+        s.delegate = self
+        s.onRetryRequested = { [weak self] in self?.open(requests: [path]) }
+        session = s; phase = .playing
+        window.orderOut(nil)
+        s.start()
+        if options.autotestMode { armAutotest() }
     }
 
     func openTorrentFile(_ path: String) {
@@ -252,14 +300,15 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         session = s; phase = .playing
         window.orderOut(nil)
         s.start()
-        if options.exitAfter != nil || !options.seekScript.isEmpty || options.startTimeoutGiven { armAutotest() }
+        if options.autotestMode { armAutotest() }
     }
 
     func playerSessionDidEnd(_ s: PlayerSession, reason: String) {
         if session === s { session = nil }
-        if case .playing = phase { phase = .choosing }
+        if case .playing = phase { phase = s.isLocal ? .idle : .choosing }           // after a local video there is no torrent file list to go back to
+        if let next = switcher.sessionDidEnd(otherSessionActive: session != nil) { begin(next); return }   // a queued replacement starts only now, after the teardown
         if reason == "retry" { return }
-        if options.exitAfter != nil || options.startTimeoutGiven || !options.seekScript.isEmpty { autotestFinish(reason: reason); return }
+        if options.autotestMode { autotestFinish(reason: reason); return }
         window.makeKeyAndOrderFront(nil)
     }
 
@@ -271,6 +320,10 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
             guard let self = self, let s = self.session else { t.invalidate(); return }
             if self.autotestStartedAt == nil { if s.playbackStarted { self.autotestStartedAt = Date() } else { return } }
             let el = Date().timeIntervalSince(self.autotestStartedAt!)
+            if self.autotestOpensDone < self.options.openScript.count, el >= self.options.openScript[self.autotestOpensDone].after {
+                let item = self.options.openScript[self.autotestOpensDone]; self.autotestOpensDone += 1
+                self.open(requests: [item.path]); return
+            }
             if self.autotestSeeksDone < self.options.seekScript.count, el >= self.options.seekScript[self.autotestSeeksDone].after {
                 s.seek(to: self.options.seekScript[self.autotestSeeksDone].to, exact: false); self.autotestSeeksDone += 1
             }

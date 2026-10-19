@@ -16,6 +16,7 @@ func parseOptions() -> AppOptions {
         case "--cache-dir": o.cacheRoot = next()
         case "--limit-mib": o.limitMiB = Int64(next() ?? "")
         case "--exit-after": o.exitAfter = Double(next() ?? "")
+        case "--open-script": if let v = next(), let c = v.firstIndex(of: ":"), let t = Double(v[v.startIndex..<c]) { o.openScript.append((t, String(v[v.index(after: c)...]))) }
         case "--seek-script": for part in (next() ?? "").split(separator: ",") { let kv = part.split(separator: ":"); if kv.count == 2, let t = Double(kv[0]), let p = Double(kv[1]) { o.seekScript.append((t, p)) } }
         case "--loopback": o.loopback = true
         case "--listen": o.listen = next()
@@ -34,6 +35,7 @@ func parseOptions() -> AppOptions {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let options = parseOptions()
     var controller: AppController!
+    var openQueue = OpenQueue()                      // open requests that arrive before the controller exists (Finder "Open With" on a cold launch)
 
     func applicationDidFinishLaunching(_ n: Notification) {
         buildMenu()
@@ -41,13 +43,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(handleURLEvent(_:reply:)), forEventClass: AEEventClass(kInternetEventClass), andEventID: AEEventID(kAEGetURL))
-        if let t = options.openTarget { DispatchQueue.main.async { self.controller.open(source: t) } }
+        let early = openQueue.markReady()
+        if !early.isEmpty { DispatchQueue.main.async { self.controller.open(requests: early) } }
+        else if let t = options.openTarget { DispatchQueue.main.async { self.controller.open(source: t) } }
     }
     @objc func handleURLEvent(_ e: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
         if let s = e.paramDescriptor(forKeyword: keyDirectObject)?.stringValue { controller.open(source: s) }
     }
     func application(_ app: NSApplication, open urls: [URL]) {
-        for u in urls { if u.isFileURL { controller.open(source: u.path) } else if u.scheme == "magnet" { controller.open(source: u.absoluteString) } }
+        // in the order macOS provides; only the first openable item is used (no playlist)
+        let requests = urls.compactMap { u -> String? in u.isFileURL ? u.path : (u.scheme == "magnet" ? u.absoluteString : nil) }
+        guard !requests.isEmpty, let now = openQueue.submit(requests) else { return }                // held until the app is ready
+        controller.open(requests: now)
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -56,7 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     func applicationShouldHandleReopen(_ app: NSApplication, hasVisibleWindows flag: Bool) -> Bool { if !flag { controller.window.makeKeyAndOrderFront(nil) }; return true }
 
-    @objc func openTorrent(_ s: Any?) { controller.chooseTorrent() }
+    @objc func openDocument(_ s: Any?) { controller.chooseFile() }
     @objc func openMagnet(_ s: Any?) { controller.window.makeKeyAndOrderFront(nil); controller.pasteMagnet() }
     @objc func openRevealLogs(_ s: Any?) { NSWorkspace.shared.activateFileViewerSelecting([controller.telemetry.url]) }
 
@@ -69,7 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         app.addItem(withTitle: "Quit TorrentPlayer", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         let fileItem = NSMenuItem(); main.addItem(fileItem)
         let file = NSMenu(title: "File"); fileItem.submenu = file
-        file.addItem(withTitle: "Open Torrent…", action: #selector(openTorrent(_:)), keyEquivalent: "o")
+        file.addItem(withTitle: "Open…", action: #selector(openDocument(_:)), keyEquivalent: "o")
         let m = file.addItem(withTitle: "Open Magnet Link from Clipboard", action: #selector(openMagnet(_:)), keyEquivalent: "l")
         m.keyEquivalentModifierMask = [.command]
         file.addItem(.separator())

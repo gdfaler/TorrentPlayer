@@ -18,7 +18,9 @@ protocol PlayerSessionDelegate: AnyObject {
 }
 
 final class PlayerSession: NSObject {
-    let engine: TPEngine, meta: TPMeta, fileIndex: Int, settings: PlayerSettings
+    let engine: TPEngine?, meta: TPMeta?, fileIndex: Int, settings: PlayerSettings
+    let localPath: String?                           // non-nil: a file played straight from disk (no torrent engine, no TPStream, no tp://)
+    var isLocal: Bool { localPath != nil }
     weak var delegate: PlayerSessionDelegate?
     let telemetry: Telemetry
     private(set) var stream: TPStream?
@@ -57,8 +59,19 @@ final class PlayerSession: NSObject {
     private var lastSystemEvent = ""
 
     init(engine: TPEngine, meta: TPMeta, fileIndex: Int, settings: PlayerSettings, displayName: String, telemetry: Telemetry) {
-        self.engine = engine; self.meta = meta; self.fileIndex = fileIndex; self.settings = settings; self.displayName = displayName; self.telemetry = telemetry
+        self.engine = engine; self.meta = meta; self.fileIndex = fileIndex; self.settings = settings; self.displayName = displayName; self.telemetry = telemetry; self.localPath = nil
         super.init()
+        wireUI()
+    }
+
+    /// Local file playback: libmpv opens the path itself. Nothing torrent-related is created.
+    init(localFile path: String, settings: PlayerSettings, telemetry: Telemetry) {
+        self.engine = nil; self.meta = nil; self.fileIndex = -1; self.settings = settings; self.displayName = ""; self.telemetry = telemetry; self.localPath = path
+        super.init()
+        wireUI()
+    }
+
+    private func wireUI() {
         bannerView.onRetry = { [weak self] in self?.retry() }
         bannerView.onCancel = { [weak self] in self?.cancel() }
         banner.contentView = bannerView
@@ -72,6 +85,8 @@ final class PlayerSession: NSObject {
 
     // MARK: start
     func start() {
+        if let path = localPath { startLocal(path); return }
+        guard let engine = engine, let meta = meta else { return }
         telemetry.emit("session_start", ["torrent": meta.name, "file": displayName, "file_index": fileIndex, "source": meta.fromMagnet ? "magnet" : "torrent_file",
                                          "cache_limit_bytes": settings.cacheLimit, "web_seed_mode": settings.webSeedMode])
         do {
@@ -85,7 +100,22 @@ final class PlayerSession: NSObject {
         telemetry.emit("stream_open", ["file_size": stream!.size, "piece_size": st.raw.piece_size, "pieces": st.raw.num_pieces,
                                        "recovery_verified": st.raw.recovery_verified, "recovery_deleted_partial": st.raw.recovery_deleted_partial,
                                        "recovery_deleted_corrupt": st.raw.recovery_deleted_corrupt, "recovery_trimmed": st.raw.recovery_trimmed])
-        let s = stream!
+        launchMpv(stream: stream!, loadTarget: "tp://stream")
+        installKeyMonitor()
+        observeSystem()
+    }
+
+    private func startLocal(_ path: String) {
+        var f = OpenClassifier.telemetryFacts(path: path)               // extension and size only: never the name or the path
+        f["source"] = "local_file"
+        telemetry.emit("session_start", f)
+        launchMpv(stream: nil, loadTarget: path)
+        installKeyMonitor()
+        observeSystem()
+    }
+
+    /// Creates the mpv instance (own window) and loads `loadTarget`. With a stream the `tp://` protocol is registered on this handle first; a local file is opened by mpv itself.
+    private func launchMpv(stream s: TPStream?, loadTarget: String) {
         let settings = self.settings, name = displayName
         mpvQueue.async { [weak self] in
             guard let h = mpv_create() else { DispatchQueue.main.async { self?.fail("Could not create the video player (mpv).") }; return }
@@ -103,15 +133,13 @@ final class PlayerSession: NSObject {
                            ("seeking", MPV_FORMAT_FLAG), ("core-idle", MPV_FORMAT_FLAG), ("mute", MPV_FORMAT_FLAG), ("volume", MPV_FORMAT_DOUBLE),
                            ("demuxer-cache-duration", MPV_FORMAT_DOUBLE)] { mpv_observe_property(h, 0, n, f) }
             mpv_request_log_messages(h, "warn")
-            let rc = tpb_register(h, s.ptr)
+            let rc = s.map { tpb_register(h, $0.ptr) } ?? 0
             if rc < 0 { DispatchQueue.main.async { self?.fail("Could not register the torrent stream with the player.") }; mpv_destroy(h); return }
             DispatchQueue.main.async { guard let self = self else { return }; self.mpv = h; self.startTimers() }
-            var args: [UnsafePointer<CChar>?] = [UnsafePointer(strdup("loadfile")), UnsafePointer(strdup("tp://stream")), nil]
+            var args: [UnsafePointer<CChar>?] = [UnsafePointer(strdup("loadfile")), UnsafePointer(strdup(loadTarget)), nil]
             _ = mpv_command(h, &args)
             _ = name
         }
-        installKeyMonitor()
-        observeSystem()
     }
 
     private func startTimers() {
@@ -263,7 +291,8 @@ final class PlayerSession: NSObject {
     private func since() -> Double { Date().timeIntervalSince(openedAt) }
 
     private func durationKnown() {
-        guard let s = stream, duration > 1 else { return }
+        guard duration > 1 else { return }
+        guard let s = stream else { telemetry.emit("duration_known", ["duration_s": duration]); return }   // local file: no torrent bitrate planning
         s.setBitrate(Double(s.size) / duration)
         telemetry.emit("duration_known", ["duration_s": duration, "avg_bitrate_bytes_per_s": Double(s.size) / duration])
     }
@@ -292,11 +321,11 @@ final class PlayerSession: NSObject {
     }
     func togglePause() { cmd(["cycle", "pause"]) }
     func seek(to target: Double, exact: Bool) {
-        guard duration > 1, let s = stream else { return }
+        guard duration > 1, (stream != nil || isLocal) else { return }
         let t = max(0, min(duration - 1.0, target))
-        let cov = coverageValue(at: t / duration)
+        let cov = stream != nil ? coverageValue(at: t / duration) : -1          // a local file has no torrent buffer coverage
         if let previous = seekTracker.issue(target: t, now: telemetry.now, fromPos: timePos, coveredAtTarget: cov) { emitSeekDone(previous) }
-        s.seekHint(Int64(t / duration * Double(s.size)))
+        if let s = stream { s.seekHint(Int64(t / duration * Double(s.size))) }
         telemetry.emit("seek_issued", ["target_s": t, "from_s": timePos, "exact": exact, "cache_coverage_at_target_0_255": cov])
         cmd(["seek", String(format: "%.3f", t), exact ? "absolute+exact" : "absolute+keyframes"])
     }
@@ -332,6 +361,11 @@ final class PlayerSession: NSObject {
     // MARK: banner composition: every wait gets a named, explained state
     func composeBanner() -> BannerContent? {
         if let e = mpvError { return BannerContent(title: "Playback error", detail: e, spinning: false, retry: true) }
+        if isLocal {                                             // a local file has no peers or buffering states: only the opening wait is shown (with Cancel)
+            if !playbackStarted { var c = BannerContent(title: "Opening video…", detail: "", spinning: true, retry: false); c.cancel = true; return c }
+            if let r = seekPending, telemetry.now - r.issued >= 1.0 { return BannerContent(title: "Seeking to \(ControlsView.format(r.target))…", detail: "", spinning: true, retry: false) }
+            return nil
+        }
         guard let s = stream else { return nil }
         let st = s.status(); let raw = st.raw
         let rate = ByteCountFormatter.string(fromByteCount: Int64(raw.download_rate), countStyle: .binary) + "/s"
@@ -458,7 +492,16 @@ final class PlayerSession: NSObject {
 
     // MARK: telemetry sampling (1 Hz)
     private func sample() {
-        guard let s = stream, !ending else { return }
+        guard !ending else { return }
+        guard let s = stream else {
+            if isLocal {                                          // local file: mpv facts only
+                if let c = seekTracker.flush(now: telemetry.now, lastPos: timePos) { emitSeekDone(c) }
+                telemetry.emit("sample", ["time_pos_s": timePos, "paused": paused, "paused_for_cache": pausedForCache, "seeking": seekPending != nil, "mpv_buffer_s": PlaybackTelemetry.bufferSeconds(demuxerBufferS),
+                                          "playing": PlaybackTelemetry.isPlaying(started: playbackStarted, paused: paused, pausedForCache: pausedForCache, seeking: seeking, coreIdle: coreIdle),
+                                          "core_idle": coreIdle, "mpv_seeking": seeking])
+            }
+            return
+        }
         let st = s.status(); let r = st.raw
         if Int(r.state) != lastTPState {
             telemetry.emit("state_change", ["from": lastTPState, "to": st.stateName, "to_qualified": qualifiedState(st), "peers": r.peers, "web_connections": r.web_connections,
@@ -562,6 +605,10 @@ final class PlayerSession: NSObject {
                                                    "stalls": self.stallDurations.count, "stall_total_s": self.stallDurations.reduce(0, +), "pieces_verified": r.pieces_verified, "hash_failures": r.hash_failures,
                                                    "hash_storage": r.hash_storage, "cap_violations": r.cap_violations, "cache_max_charged": r.cache_max_charged, "cache_limit": r.cache_limit])
                 s.close()
+            } else if self.isLocal {
+                self.telemetry.emit("session_end", ["reason": reason, "teardown_s": td, "duration_open_s": self.since(), "playback_started": self.playbackStarted, "source": "local_file",
+                                                   "seeks": self.seekLatencies.count, "seek_latency_median_s": self.median(self.seekLatencies), "seek_latency_max_s": self.seekLatencies.max() ?? -1,
+                                                   "stalls": self.stallDurations.count, "stall_total_s": self.stallDurations.reduce(0, +)])
             }
             self.stream = nil
             self.delegate?.playerSessionDidEnd(self, reason: reason)
