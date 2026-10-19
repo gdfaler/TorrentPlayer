@@ -5,7 +5,11 @@
 import Foundation
 
 struct SeekTracker {
-    struct Record { var target: Double; var issued: Double; var fromPos: Double; var coveredAtTarget: Int; var sawSeek = false }
+    struct Record {
+        var target: Double; var issued: Double; var fromPos: Double; var coveredAtTarget: Int; var sawSeek = false
+        var mpvSawSeeking = false      // mpv's own `seeking` flag was seen true for this request (display hold)
+        var released = false           // the display hold ended without a completion (the request looks failed or ignored); sticky
+    }
     struct Completed {
         var record: Record
         var latency: Double          // issue -> PLAYBACK_RESTART
@@ -17,6 +21,8 @@ struct SeekTracker {
     static let unmatchedGrace = 2.0
     /// How long to wait for the position update that follows a restart before falling back to the last known position.
     static let positionWait = 1.0
+    /// A seek mpv never reports as seeking is considered failed/ignored after this many seconds: the seek bar goes back to following mpv.
+    static let noSeekGrace = 2.0
 
     private(set) var pending: Record?
     private var awaiting: (record: Record, latency: Double, restartedAt: Double, matched: Bool)?
@@ -51,4 +57,27 @@ struct SeekTracker {
         awaiting = nil
         return Completed(record: a.record, latency: a.latency, landed: lastPos, landedSource: "fallback", matchedSeekEvent: a.matched)
     }
+
+    /// The position (seconds) the seek bar and time label must keep showing while a seek is in flight, or nil when they should follow mpv's `time-pos`.
+    /// Without it an old `time-pos` still in the pipeline overwrites the thumb right after the slider is released (it snaps back, then jumps forward).
+    ///  - pending (issued, mpv has not restarted): held while mpv reports `seeking` (a torrent seek can legitimately wait a long time for data);
+    ///    if mpv never reports it within `noSeekGrace` the request is treated as failed/ignored and the hold is released for good;
+    ///  - restarted, waiting for the new position: held until that update arrives or `positionWait` passes.
+    mutating func heldTarget(now: Double, mpvSeeking: Bool) -> Double? {
+        if var p = pending {
+            if mpvSeeking { p.mpvSawSeeking = true }
+            if !p.released && !p.mpvSawSeeking && now - p.issued >= SeekTracker.noSeekGrace { p.released = true }
+            pending = p
+            return p.released ? nil : p.target
+        }
+        if let a = awaiting, now - a.restartedAt < SeekTracker.positionWait { return a.record.target }
+        return nil
+    }
+}
+
+/// What the controls display (pure, so the snap-back rules are testable).
+enum SeekDisplay {
+    /// While a seek is held the target is shown; otherwise mpv's position.
+    static func seconds(actual: Double, held: Double?) -> Double { held ?? actual }
+    static func fraction(seconds: Double, duration: Double) -> Double { duration > 0 ? max(0, min(1, seconds / duration)) : 0 }
 }

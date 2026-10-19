@@ -414,9 +414,14 @@ final class PlayerSession: NSObject {
         }
         if let s = stream, tick % 4 == 0 { coverageCache = s.coverage(400); controlsView.seekBar.coverage = coverageCache }
         tick += 1
-        controlsView.timeLabel.stringValue = ControlsView.format(timePos)
         controlsView.durationLabel.stringValue = ControlsView.format(duration)
-        if duration > 0 { controlsView.seekBar.fraction = max(0, min(1, timePos / duration)) }
+        // the user owns the thumb while dragging; after release it stays at the target until mpv has really moved (a stale time-pos must not pull it back)
+        if !controlsView.seekBar.dragging {
+            let held = mpvError == nil ? seekTracker.heldTarget(now: telemetry.now, mpvSeeking: seeking) : nil
+            let shown = SeekDisplay.seconds(actual: timePos, held: held)
+            controlsView.timeLabel.stringValue = ControlsView.format(shown)
+            if duration > 0 { controlsView.seekBar.fraction = SeekDisplay.fraction(seconds: shown, duration: duration) }
+        }
         controlsView.setPlaying(!paused)
         // banner
         let content = composeBanner()
