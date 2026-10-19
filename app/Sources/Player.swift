@@ -333,8 +333,9 @@ final class PlayerSession: NSObject {
         telemetry.emit("seek_done", ["target_s": c.record.target, "latency_s": c.latency, "landed_s": c.landed, "landed_source": c.landedSource, "from_s": c.record.fromPos,
                                      "cache_coverage_at_target_0_255": c.record.coveredAtTarget, "seek_event_seen": c.matchedSeekEvent])
     }
-    func seekRelative(_ d: Double) { seek(to: timePos + d, exact: abs(d) <= 10) }
-    func seekFraction(_ f: Double) { seek(to: f * duration, exact: false) }
+    func seekRelative(_ d: Double) { seek(to: timePos + d, exact: SeekMode.exact(forRelative: d)) }
+    /// Seek bar release (one seek per release, never while dragging): precise for a local file so playback lands where the thumb was dropped; torrents keep keyframe seeks (they need less data).
+    func seekFraction(_ f: Double) { seek(to: f * duration, exact: SeekMode.exact(forSliderRelease: isLocal)) }
     private func coverageValue(at f: Double) -> Int {
         guard !coverageCache.isEmpty else { return -1 }
         return Int(coverageCache[max(0, min(coverageCache.count - 1, Int(f * Double(coverageCache.count))))])

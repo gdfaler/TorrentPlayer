@@ -81,3 +81,11 @@ enum SeekDisplay {
     static func seconds(actual: Double, held: Double?) -> Double { held ?? actual }
     static func fraction(seconds: Double, duration: Double) -> Double { duration > 0 ? max(0, min(1, seconds / duration)) : 0 }
 }
+
+/// Which mpv seek mode each kind of request uses (pure, so the policy is testable).
+enum SeekMode {
+    /// Slider release: precise only for local files. Keyframe seeks land on the keyframe before the target (up to a whole keyframe interval early), which made the thumb jump.
+    static func exact(forSliderRelease isLocal: Bool) -> Bool { isLocal }
+    /// Relative (keyboard) seeks of 10 s or less are precise, longer ones use keyframes: unchanged behaviour.
+    static func exact(forRelative delta: Double) -> Bool { abs(delta) <= 10 }
+}

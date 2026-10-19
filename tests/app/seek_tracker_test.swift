@@ -132,6 +132,10 @@ import Foundation
         t = SeekTracker()
         check(t.heldTarget(now: 5, mpvSeeking: true) == nil, "nothing held without a seek")
 
+        // 20. seek mode policy: precise slider seeks for local files only; keyboard rule unchanged
+        check(SeekMode.exact(forSliderRelease: true) && !SeekMode.exact(forSliderRelease: false), "slider release: exact for local files, keyframes for torrents")
+        check(SeekMode.exact(forRelative: 5) && SeekMode.exact(forRelative: -10) && !SeekMode.exact(forRelative: 30) && !SeekMode.exact(forRelative: -30.5), "relative seeks: exact up to 10 s (unchanged)")
+
         print("seek tracker: \(checks) checks, \(failures) failures")
         exit(failures == 0 ? 0 : 1)
     }
