@@ -37,6 +37,7 @@ final class PlayerSession: NSObject {
     // ---- observed mpv state (main thread only)
     private(set) var timePos = 0.0, duration = 0.0
     private var paused = false, pausedForCache = false, seeking = false, coreIdle = true
+    private var demuxerBufferS: Double?                  // mpv `demuxer-cache-duration`; nil while mpv reports it unavailable
     private(set) var playbackStarted = false
     private var mpvError: String?
     private var ending = false
@@ -99,7 +100,8 @@ final class PlayerSession: NSObject {
             if settings.mute { opt("mute", "yes") }
             if mpv_initialize(h) < 0 { DispatchQueue.main.async { self?.fail("Could not initialise the video player (mpv).") }; mpv_destroy(h); return }
             for (n, f) in [("time-pos", MPV_FORMAT_DOUBLE), ("duration", MPV_FORMAT_DOUBLE), ("pause", MPV_FORMAT_FLAG), ("paused-for-cache", MPV_FORMAT_FLAG),
-                           ("seeking", MPV_FORMAT_FLAG), ("core-idle", MPV_FORMAT_FLAG), ("mute", MPV_FORMAT_FLAG), ("volume", MPV_FORMAT_DOUBLE)] { mpv_observe_property(h, 0, n, f) }
+                           ("seeking", MPV_FORMAT_FLAG), ("core-idle", MPV_FORMAT_FLAG), ("mute", MPV_FORMAT_FLAG), ("volume", MPV_FORMAT_DOUBLE),
+                           ("demuxer-cache-duration", MPV_FORMAT_DOUBLE)] { mpv_observe_property(h, 0, n, f) }
             mpv_request_log_messages(h, "warn")
             let rc = tpb_register(h, s.ptr)
             if rc < 0 { DispatchQueue.main.async { self?.fail("Could not register the torrent stream with the player.") }; mpv_destroy(h); return }
@@ -155,11 +157,12 @@ final class PlayerSession: NSObject {
         case MPV_EVENT_PROPERTY_CHANGE:
             guard let d = ev.pointee.data else { return }
             let p = d.assumingMemoryBound(to: mpv_event_property.self).pointee
-            guard p.format != MPV_FORMAT_NONE, let data = p.data else { return }
             let name = String(cString: p.name)
+            if p.format == MPV_FORMAT_NONE { if name == "demuxer-cache-duration" { demuxerBufferS = nil }; return }   // property became unavailable
+            guard let data = p.data else { return }
             if p.format == MPV_FORMAT_DOUBLE {
                 let v = data.assumingMemoryBound(to: Double.self).pointee
-                if name == "time-pos" { timePos = v; if let c = seekTracker.positionUpdated(v) { emitSeekDone(c) } } else if name == "duration" { if v > 0 && duration != v { duration = v; durationKnown() } }
+                if name == "demuxer-cache-duration" { demuxerBufferS = v } else if name == "time-pos" { timePos = v; if let c = seekTracker.positionUpdated(v) { emitSeekDone(c) } } else if name == "duration" { if v > 0 && duration != v { duration = v; durationKnown() } }
             } else if p.format == MPV_FORMAT_FLAG {
                 let v = data.assumingMemoryBound(to: Int32.self).pointee != 0
                 switch name {
@@ -179,9 +182,12 @@ final class PlayerSession: NSObject {
                 playbackStarted = true
                 telemetry.emit("playback_started", ["since_open_s": since(), "note": "first PLAYBACK_RESTART (decoder running); approximates first frame"])
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in self?.reportGeometry() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in self?.requestAudioInfo() }   // diagnostics only: read-only property queries
             }
             // Completes the pending seek only when mpv reported that seek's start; `seek_done` is written once the position after the restart is known.
             if let lat = seekTracker.restarted(now: telemetry.now) { seekLatencies.append(lat) }
+        case MPV_EVENT_GET_PROPERTY_REPLY:
+            audioInfoReply(ev)
         case MPV_EVENT_END_FILE:
             guard let d = ev.pointee.data else { return }
             let ef = d.assumingMemoryBound(to: mpv_event_end_file.self).pointee
@@ -201,6 +207,57 @@ final class PlayerSession: NSObject {
         }
     }
     private var logCount = 0
+
+    // MARK: audio diagnostics (read-only: asynchronous property queries; nothing is set, nothing blocks)
+    private static let audioReplyBase: UInt64 = 0x7470_6101
+    private var audioReplies: [Int: Any] = [:]                       // index into PlaybackTelemetry.audioProperties -> value (NSNull = unavailable)
+    private var audioInfoRequested = false
+    private func requestAudioInfo() {
+        guard let h = mpv, !ending, !audioInfoRequested else { return }
+        audioInfoRequested = true
+        for (i, name) in PlaybackTelemetry.audioProperties.enumerated() {
+            let fmt = name.hasSuffix("params") ? MPV_FORMAT_NODE : MPV_FORMAT_STRING
+            if mpv_get_property_async(h, PlayerSession.audioReplyBase + UInt64(i), name, fmt) < 0 { audioReplies[i] = NSNull() }
+        }
+        emitAudioInfoIfComplete()
+    }
+    private func audioInfoReply(_ ev: UnsafeMutablePointer<mpv_event>) {
+        let i = Int(ev.pointee.reply_userdata &- PlayerSession.audioReplyBase)
+        guard i >= 0, i < PlaybackTelemetry.audioProperties.count, audioInfoRequested else { return }
+        var value: Any?
+        if ev.pointee.error >= 0, let d = ev.pointee.data {
+            let p = d.assumingMemoryBound(to: mpv_event_property.self).pointee
+            if let data = p.data {
+                if p.format == MPV_FORMAT_STRING { value = data.assumingMemoryBound(to: UnsafeMutablePointer<CChar>?.self).pointee.map { String(cString: $0) } }
+                else if p.format == MPV_FORMAT_NODE { value = nodeMap(data.assumingMemoryBound(to: mpv_node.self).pointee) }
+            }
+        }
+        audioReplies[i] = value ?? NSNull()
+        emitAudioInfoIfComplete()
+    }
+    private func nodeMap(_ n: mpv_node) -> [String: Any]? {
+        guard n.format == MPV_FORMAT_NODE_MAP, let l = n.u.list, let keys = l.pointee.keys, let values = l.pointee.values else { return nil }
+        var out: [String: Any] = [:]
+        for i in 0..<Int(l.pointee.num) {
+            guard let kp = keys[i] else { continue }
+            let key = String(cString: kp), v = values[i]
+            switch v.format {
+            case MPV_FORMAT_STRING: if let s = v.u.string { out[key] = String(cString: s) }
+            case MPV_FORMAT_INT64: out[key] = Int(v.u.int64)
+            case MPV_FORMAT_DOUBLE: out[key] = v.u.double_
+            case MPV_FORMAT_FLAG: out[key] = v.u.flag != 0
+            default: break
+            }
+        }
+        return out
+    }
+    private func emitAudioInfoIfComplete() {
+        guard audioReplies.count == PlaybackTelemetry.audioProperties.count else { return }
+        let r = audioReplies
+        telemetry.emit("audio_info", PlaybackTelemetry.audioInfo(currentAO: r[0] as? String, audioDevice: r[1] as? String,
+                                                                 audioParams: r[2] as? [String: Any], audioOutParams: r[3] as? [String: Any]))
+        audioReplies.removeAll()
+    }
     private var hungStream: TPStream?
 
     private func since() -> Double { Date().timeIntervalSince(openedAt) }
@@ -418,7 +475,11 @@ final class PlayerSession: NSObject {
             "ahead_bytes": r.contiguous_ahead_bytes, "ahead_s": bitrate > 0 ? Double(r.contiguous_ahead_bytes) / bitrate : -1, "blocked_readers": r.blocked_readers,
             "cache_charged": r.cache_charged, "cache_limit": r.cache_limit, "pieces_present": r.pieces_present, "pieces_verified": r.pieces_verified,
             "hash_failures": r.hash_failures, "hash_incomplete": r.hash_incomplete, "un_have_resets": r.un_have_resets, "watchdog_kicks": r.watchdog_kicks, "cap_violations": r.cap_violations,
-            "time_pos_s": timePos, "paused": paused, "paused_for_cache": pausedForCache, "seeking": seekPending != nil, "peer_bytes": r.peer_bytes, "web_bytes": r.web_bytes]
+            "time_pos_s": timePos, "paused": paused, "paused_for_cache": pausedForCache, "seeking": seekPending != nil, "peer_bytes": r.peer_bytes, "web_bytes": r.web_bytes,
+            // `ahead_s` above is the torrent reader's download frontier; the next three describe mpv: its demuxer buffer, whether it is advancing playback, and its flags.
+            "mpv_buffer_s": PlaybackTelemetry.bufferSeconds(demuxerBufferS),
+            "playing": PlaybackTelemetry.isPlaying(started: playbackStarted, paused: paused, pausedForCache: pausedForCache, seeking: seeking, coreIdle: coreIdle),
+            "core_idle": coreIdle, "mpv_seeking": seeking]
             .merging(WaitText.fields(r)) { a, _ in a })
         // a prolonged wait for one piece is recorded with the core's own event log and the last web-seed error (facts for diagnosis; no conclusion is drawn here)
         if r.wait_no_progress_s >= WaitText.slowAfter && telemetry.now - lastWaitSnapshot >= 60.0 {
