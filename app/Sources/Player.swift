@@ -27,17 +27,19 @@ final class PlayerSession: NSObject {
     private var mpv: OpaquePointer?
     private var mpvWindow: NSWindow?
     private let banner = OverlayPanel(size: NSSize(width: 360, height: 120))
-    private let controlsPanel = OverlayPanel(size: NSSize(width: 600, height: 48))
     private let bannerView = BannerView(frame: NSRect(x: 0, y: 0, width: 360, height: 120))
-    private let controlsView = ControlsView(frame: NSRect(x: 0, y: 0, width: 600, height: 48))
+    private let controls = GlassControls()                   // native glass playback controls (GlassControls.swift); every button calls an action below
+    private var controlsView: ControlsView { controls.view }
     private let mpvQueue = DispatchQueue(label: "tp.mpv.setup")
     private var pollTimer: Timer?, uiTimer: Timer?, sampleTimer: Timer?
     private var keyMonitor: Any?
+    private var mouseMonitor: Any?
     private var observers: [NSObjectProtocol] = []
     private let displayName: String
 
     // ---- observed mpv state (main thread only)
     private(set) var timePos = 0.0, duration = 0.0
+    private var muted = false
     private var paused = false, pausedForCache = false, seeking = false, coreIdle = true
     private var demuxerBufferS: Double?                  // mpv `demuxer-cache-duration`; nil while mpv reports it unavailable
     private(set) var playbackStarted = false
@@ -75,8 +77,16 @@ final class PlayerSession: NSObject {
         bannerView.onRetry = { [weak self] in self?.retry() }
         bannerView.onCancel = { [weak self] in self?.cancel() }
         banner.contentView = bannerView
-        controlsPanel.contentView = controlsView
         controlsView.onPlayPause = { [weak self] in self?.togglePause() }
+#if TP_TESTING
+        controls.testState = { [weak self] in guard let s = self else { return [:] }; return ["paused": s.paused, "muted": s.muted, "time_pos": s.timePos, "fullscreen": s.mpvWindow?.styleMask.contains(.fullScreen) ?? false] }
+#endif
+        controlsView.onBack10 = { [weak self] in self?.seekRelative(-10) }
+        controlsView.onFwd10 = { [weak self] in self?.seekRelative(10) }
+        controlsView.onMute = { [weak self] in self?.toggleMute() }
+        controlsView.onFullscreen = { [weak self] in self?.toggleFullScreen() }
+        controlsView.onToggleExpanded = { [weak self] in self?.controls.toggleExpanded() }
+        controlsView.seekBar.onStep = { [weak self] d in self?.seekRelative(d) }
         controlsView.seekBar.onSeek = { [weak self] f in self?.seekFraction(f) }
         controlsView.seekBar.onScrub = { [weak self] f in guard let s = self else { return }; s.controlsView.timeLabel.stringValue = ControlsView.format(f * s.duration) }
     }
@@ -195,6 +205,7 @@ final class PlayerSession: NSObject {
                 let v = data.assumingMemoryBound(to: Int32.self).pointee != 0
                 switch name {
                 case "pause": paused = v; controlsView.setPlaying(!v)
+                case "mute": muted = v; controlsView.setMuted(v)
                 case "paused-for-cache": setPausedForCache(v)
                 case "seeking": seeking = v
                 case "core-idle": coreIdle = v
@@ -411,7 +422,8 @@ final class PlayerSession: NSObject {
     private func uiTick() {
         guard !ending else { return }
         if mpvWindow == nil {
-            if let w = NSApp.windows.first(where: { $0.title == "TorrentPlayer" && $0 !== fallbackWindow && $0.contentView != nil }) { attach(to: w) }
+            // only a VISIBLE window: a replaced session's mpv window is hidden but stays in NSApp.windows, and the next session used to attach its controls to that stale window
+            if let w = NSApp.windows.first(where: { $0.title == "TorrentPlayer" && $0 !== fallbackWindow && $0.contentView != nil && $0.isVisible }) { attach(to: w) }
         }
         if let s = stream, tick % 4 == 0 { coverageCache = s.coverage(400); controlsView.seekBar.coverage = coverageCache }
         tick += 1
@@ -420,7 +432,7 @@ final class PlayerSession: NSObject {
         if !controlsView.seekBar.dragging {
             let held = mpvError == nil ? seekTracker.heldTarget(now: telemetry.now, mpvSeeking: seeking) : nil
             let shown = SeekDisplay.seconds(actual: timePos, held: held)
-            controlsView.timeLabel.stringValue = ControlsView.format(shown)
+            controlsView.timeLabel.stringValue = ControlsView.format(shown); controlsView.seekBar.valueText = controlsView.timeLabel.stringValue
             if duration > 0 { controlsView.seekBar.fraction = SeekDisplay.fraction(seconds: shown, duration: duration) }
         }
         controlsView.setPlaying(!paused)
@@ -436,18 +448,16 @@ final class PlayerSession: NSObject {
         if let c = content {
             let size = bannerView.set(title: c.title, detail: c.detail, spinning: c.spinning, retry: c.retry, note: c.note, progress: c.progress, cancel: c.cancel)
             banner.setContentSize(size)
-            positionOverlays()
+            positionBanner()
             if !banner.isVisible, let w = mpvWindow { if banner.parent == nil { w.addChildWindow(banner, ordered: .above) }; banner.orderFront(nil) }
             bannerShown = true
         } else if bannerShown { mpvWindow?.removeChildWindow(banner); banner.orderOut(nil); bannerShown = false }
-        // controls auto-hide: visible while paused, banner showing, or the mouse moved in the last 3 s
+        // controls auto-hide: visible while paused, a banner is showing, the user is dragging the seek bar or pointing at the controls, or the mouse / keyboard was used in the last 3 s
         let loc = NSEvent.mouseLocation
         if loc != lastMouse { lastMouse = loc; if let f = mpvWindow?.frame, f.contains(loc) { lastMouseMove = Date() } }
-        let show = paused || content != nil || Date().timeIntervalSince(lastMouseMove) < 3.0 || !playbackStarted
-        if mpvWindow != nil {
-            if show && !controlsPanel.isVisible, let w = mpvWindow { if controlsPanel.parent == nil { w.addChildWindow(controlsPanel, ordered: .above) }; controlsPanel.orderFront(nil) }
-            if !show && controlsPanel.isVisible { mpvWindow?.removeChildWindow(controlsPanel); controlsPanel.orderOut(nil) }
-        }
+        if controlsView.seekBar.dragging { lastMouseMove = Date() }          // after a drag ends the controls stay for the usual 3 s
+        let show = paused || content != nil || controlsView.seekBar.dragging || controls.pointerIsOverControls || Date().timeIntervalSince(lastMouseMove) < 3.0 || !playbackStarted
+        if mpvWindow != nil { controls.setVisible(show) }
         // the hash-failure classifier result is surfaced as a telemetry event the first time it changes
         if let s = stream, tick % 4 == 0 { let st = s.status().raw; if Int(st.hash_failures) != lastHashFailures { lastHashFailures = Int(st.hash_failures)
             telemetry.emit("hash_failure", ["total": lastHashFailures, "storage": st.hash_storage, "arrived": st.hash_arrived, "undetermined": st.hash_undetermined, "report": s.lastHashReport()]) } }
@@ -458,7 +468,12 @@ final class PlayerSession: NSObject {
     private func attach(to w: NSWindow) {
         mpvWindow = w
         w.acceptsMouseMovedEvents = true
-        w.addChildWindow(controlsPanel, ordered: .above)
+        controls.attach(to: w)
+        // pointer movement over the video or the controls shows them at once (the 0.25 s UI tick alone would make them appear late)
+        mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .leftMouseDragged]) { [weak self] e in
+            if let s = self, !s.ending, e.window === s.mpvWindow || e.window === s.controls.panel { s.lastMouseMove = Date(); s.controls.setVisible(true) }
+            return e
+        }
         positionOverlays()
         for n in [NSWindow.didResizeNotification, NSWindow.didMoveNotification, NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification, NSWindow.didEndLiveResizeNotification, NSWindow.didChangeScreenNotification] {
             observers.append(NotificationCenter.default.addObserver(forName: n, object: w, queue: .main) { [weak self] _ in self?.positionOverlays() })
@@ -477,8 +492,8 @@ final class PlayerSession: NSObject {
         let ds = ml?.drawableSize ?? .zero
         telemetry.emit("window_geometry", ["window": NSStringFromRect(w.frame), "content_pt": NSStringFromSize(cs), "scale": scale, "drawable_px": NSStringFromSize(ds),
             "drawable_matches_backing": abs(ds.width - cs.width * scale) <= 1 && abs(ds.height - cs.height * scale) <= 1, "has_metal_layer": ml != nil,
-            "controls_frame": NSStringFromRect(controlsPanel.frame), "controls_is_child": w.childWindows?.contains(controlsPanel) ?? false,
-            "banner_visible": banner.isVisible, "banner_is_child": w.childWindows?.contains(banner) ?? false, "controls_visible": controlsPanel.isVisible, "screens": NSScreen.screens.count, "fullscreen": w.styleMask.contains(.fullScreen)])
+            "controls_frame": NSStringFromRect(controls.panel.frame), "controls_is_child": w.childWindows?.contains(controls.panel) ?? false,
+            "banner_visible": banner.isVisible, "banner_is_child": w.childWindows?.contains(banner) ?? false, "controls_visible": controls.isShownToUser, "screens": NSScreen.screens.count, "fullscreen": w.styleMask.contains(.fullScreen)])
         if let dir = ProcessInfo.processInfo.environment["TP_SNAPSHOT_DIR"] {            // own views rendered into PNGs (no screen capture, no permission prompt)
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
             for (name, v) in [("controls", controlsView as NSView), ("banner", bannerView as NSView)] {
@@ -488,10 +503,12 @@ final class PlayerSession: NSObject {
     }
 
     private func positionOverlays() {
+        controls.reposition(animated: false)
+        positionBanner()
+    }
+    private func positionBanner() {
         guard let w = mpvWindow, let cv = w.contentView else { return }
         let v = w.convertToScreen(cv.convert(cv.bounds, to: nil))
-        let cw = max(260, min(900, v.width - 40))
-        controlsPanel.setFrame(NSRect(x: v.midX - cw / 2, y: v.minY + 20, width: cw, height: 48), display: true)
         let bs = banner.frame.size
         banner.setFrame(NSRect(x: v.midX - bs.width / 2, y: v.midY - bs.height / 2 + 20, width: bs.width, height: bs.height), display: true)
     }
@@ -557,6 +574,7 @@ final class PlayerSession: NSObject {
             guard let self = self, !self.ending else { return e }
             let cmdDown = e.modifierFlags.contains(.command)
             if cmdDown { return e }                                        // menu shortcuts
+            self.lastMouseMove = Date()                                    // keyboard use keeps the controls visible, like pointer movement
             let shift = e.modifierFlags.contains(.shift)
             switch e.keyCode {
             case 49: self.togglePause(); return nil                        // space
@@ -573,6 +591,7 @@ final class PlayerSession: NSObject {
             switch e.charactersIgnoringModifiers?.lowercased() {
             case "f": self.toggleFullScreen(); return nil
             case "m": self.toggleMute(); return nil
+            case "e": self.controls.toggleExpanded(); return nil
             case "r": if self.mpvError != nil { self.retry(); return nil }
             default: break
             }
@@ -592,10 +611,11 @@ final class PlayerSession: NSObject {
         ending = true
         pollTimer?.invalidate(); uiTimer?.invalidate(); sampleTimer?.invalidate()
         if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
+        if let m = mouseMonitor { NSEvent.removeMonitor(m); mouseMonitor = nil }
         for o in observers { NotificationCenter.default.removeObserver(o); NSWorkspace.shared.notificationCenter.removeObserver(o) }
         observers.removeAll()
-        controlsPanel.orderOut(nil); banner.orderOut(nil)
-        mpvWindow?.removeChildWindow(controlsPanel); mpvWindow?.removeChildWindow(banner)
+        controls.teardown(); banner.orderOut(nil)
+        mpvWindow?.removeChildWindow(banner)
         fallbackWindow?.close(); fallbackWindow = nil
         let h = mpv; mpv = nil
         let t0 = Date()

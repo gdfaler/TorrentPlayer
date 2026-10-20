@@ -122,6 +122,26 @@ import CoreGraphics
             check(l.frames[.play] != nil, "w=\(w): play/pause is always present")
         }
 
+        // 4c. production variant without the inspector button (Milestone 2A): same invariants, narrower thresholds
+        let thNo = GlassLayout.minimumExpandedContentWidth(includesInspector: false)
+        check(near(thNo, 508), "without the inspector button the expanded toolbar needs 508 pt (\(thNo))")
+        for (size, fs, name) in sizes { for ex in [false, true] {
+            let l = GlassLayout.make(content: size, fullscreen: fs, expanded: ex, inspectorOpen: false, includesInspector: false)
+            invariants(l, size, fullscreen: fs, expandedAsked: ex, inspectorAsked: false, "noinsp \(name) ex=\(ex)")
+            check(l.frames[.inspector] == nil, "noinsp \(name): no inspector button")
+            if ex { check(l.expanded && l.hidden.isEmpty && l.frames.count == 7, "noinsp \(name): back10 play fwd10 seek volume fullscreen expand") }
+        } }
+        let ni = GlassLayout.make(content: CGSize(width: 800, height: 480), fullscreen: false, expanded: true, inspectorOpen: false, includesInspector: false)
+        check(near(ni.toolbar.width, 732 - 58) && near(ni.frames[.seek]!.width, 280), "800 wide, no inspector: toolbar 674 wide, seek 280 (\(ni.toolbar.width))")
+        let nn = GlassLayout.make(content: CGSize(width: 520, height: 400), fullscreen: false, expanded: true, inspectorOpen: false, includesInspector: false)
+        check(nn.expanded && nn.hidden == [.volume] && nn.frames[.fullscreen] != nil, "520 wide, no inspector: volume dropped, fullscreen kept")
+        let nb = GlassLayout.make(content: CGSize(width: thNo - 0.5, height: 400), fullscreen: false, expanded: true, inspectorOpen: false, includesInspector: false)
+        check(!nb.expanded && !nb.canExpand, "just below 508: compact, canExpand false")
+
+        // 4d. the hit rule that fixed the Play -> fullscreen bug
+        check(!GlassHitRule.accepts(isHidden: true, contentAlpha: 1) && !GlassHitRule.accepts(isHidden: false, contentAlpha: 0) && !GlassHitRule.accepts(isHidden: false, contentAlpha: 0.49), "hidden or faded-out surfaces take no mouse events")
+        check(GlassHitRule.accepts(isHidden: false, contentAlpha: 0.5) && GlassHitRule.accepts(isHidden: false, contentAlpha: 1), "visible surfaces take mouse events")
+
         // 5. accessibility: Reduce Motion
         let base = GlassPolicy.resolve(GlassEnvironment())
         check(base.motion.animates && near(CGFloat(base.motion.expandDuration), 0.38, 0.0001), "default: the approved 380 ms expansion")
@@ -145,14 +165,22 @@ import CoreGraphics
         let both = GlassPolicy.resolve(GlassEnvironment(reduceMotion: true, reduceTransparency: true, increaseContrast: true))
         check(both.treatment.surface == .opaque && both.treatment.secondaryText == .text && both.treatment.hairlineContrast() > rt.treatment.hairlineContrast() && !both.motion.animates, "all three together")
 
-        // 7. readability: every supported treatment, designed for the worst case (white frame), also fine over black
-        for (name, env) in [("default", GlassEnvironment()), ("increase contrast", GlassEnvironment(increaseContrast: true)), ("reduce transparency", GlassEnvironment(reduceTransparency: true)),
-                            ("reduce motion", GlassEnvironment(reduceMotion: true)), ("IC+RT", GlassEnvironment(reduceTransparency: true, increaseContrast: true))] {
+        // 7. readability: the default is native regular glass, no tint, gradient 10 % (provisional). KNOWN limitation: BELOW 4.5:1 over bright video (modelled ~1.8:1 over a pure white frame);
+        // Increase Contrast and the opaque surface reach >= 4.5:1.
+        let def = GlassPolicy.resolve(GlassEnvironment()).treatment
+        check(!def.clearStyle && def.tintOpacity == 0 && def.gradientOpacity == 0.10 && def.surface == .glass, "default treatment = regular glass, no tint, gradient 10 %")
+        check(def.primaryContrastOverWhiteFrame() < 4.5, "default: contrast over a pure white frame is below 4.5:1 (documented limitation; modelled \(def.primaryContrastOverWhiteFrame()))")
+        check(def.primaryContrastOverBlackFrame() >= 4.5, "default: over a black frame >= 4.5:1 (\(def.primaryContrastOverBlackFrame()))")
+        for (name, env) in [("increase contrast", GlassEnvironment(increaseContrast: true)), ("reduce transparency", GlassEnvironment(reduceTransparency: true)), ("IC+RT", GlassEnvironment(reduceTransparency: true, increaseContrast: true))] {
             let t = GlassPolicy.resolve(env).treatment
             check(t.primaryContrastOverWhiteFrame() >= 4.5, "\(name): primary text over a white frame >= 4.5:1 (\(t.primaryContrastOverWhiteFrame()))")
             check(t.secondaryContrastOverWhiteFrame() >= 4.5, "\(name): secondary text over a white frame >= 4.5:1 (\(t.secondaryContrastOverWhiteFrame()))")
             check(t.primaryContrastOverBlackFrame() >= 4.5, "\(name): primary text over a black frame >= 4.5:1")
-            check(t.gradientOpacity <= 0.9 && t.tintOpacity <= 0.5, "\(name): the scrim does not hide the video")
+        }
+        for env in [GlassEnvironment(), GlassEnvironment(increaseContrast: true), GlassEnvironment(reduceMotion: true)] {
+            let t = GlassPolicy.resolve(env).treatment
+            check(t.gradientOpacity <= 0.9 && t.tintOpacity <= 0.5, "the scrim does not hide the video")
+            check(GlassPolicy.resolve(env).treatment.secondaryText == .text, "no dimmed text on glass")
         }
         check(GlassRGB.contrast(.white, .black) > 20.9 && GlassRGB.contrast(.white, .white) < 1.01, "contrast helper sanity")
         check(near(CGFloat(GlassRGB(hex: 0x1B2028).r * 255), 27, 0.01), "hex parsing")

@@ -94,6 +94,13 @@ enum GlassMetrics {
     }
 }
 
+/// A control surface may receive mouse events only while it is shown and its content is (nearly) visible. Alpha 0 does NOT stop AppKit hit-testing: in the first
+/// Motion Lab the collapsed toolbar kept six invisible buttons stacked under Play and the last one (Fullscreen) took Play's clicks.
+enum GlassHitRule {
+    static let minimumContentAlpha: CGFloat = 0.5
+    static func accepts(isHidden: Bool, contentAlpha: CGFloat) -> Bool { !isHidden && contentAlpha >= minimumContentAlpha }
+}
+
 // MARK: layout
 struct GlassLayout: Equatable {
     var frames: [GlassControl: CGRect]      // visible controls only
@@ -104,7 +111,10 @@ struct GlassLayout: Equatable {
     var inspector: CGRect?                  // nil when closed or when there is not enough height
     var gradientHeight: CGFloat             // height of the readability gradient from the bottom edge
 
-    private static let expandedUtilitySets: [[GlassControl]] = [[.volume, .inspector, .fullscreen], [.inspector, .fullscreen]]
+    /// Utility buttons of the expanded toolbar, widest set first (the narrower set drops volume). Without an inspector (before it exists) the inspector button is not offered.
+    private static func utilitySets(includesInspector: Bool) -> [[GlassControl]] {
+        includesInspector ? [[.volume, .inspector, .fullscreen], [.inspector, .fullscreen]] : [[.volume, .fullscreen], [.fullscreen]]
+    }
     /// Width of the expanded toolbar without the seek bar.
     private static func expandedFixedWidth(utilityCount n: Int) -> CGFloat {
         typealias M = GlassMetrics
@@ -113,18 +123,21 @@ struct GlassLayout: Equatable {
         return transportW + M.groupGap + M.groupGap + utilW + M.groupGap + M.expandSize
     }
     /// The expanded toolbar for this content width: all utility buttons if they fit (seek bar shrinking down to its minimum), else without volume, else nil.
-    private static func expandedPlan(contentWidth: CGFloat) -> (utility: [GlassControl], seekWidth: CGFloat)? {
+    private static func expandedPlan(contentWidth: CGFloat, includesInspector: Bool) -> (utility: [GlassControl], seekWidth: CGFloat)? {
         typealias M = GlassMetrics
         let avail = contentWidth - 2 * M.sideMargin
         let preferred = min(max(contentWidth * M.seekWidthFraction, M.seekWidthRange.lowerBound), M.seekWidthRange.upperBound)
-        for utility in expandedUtilitySets {
+        for utility in utilitySets(includesInspector: includesInspector) {
             let seekW = min(preferred, avail - expandedFixedWidth(utilityCount: utility.count))
             if seekW >= M.seekWidthMin { return (utility, seekW) }
         }
         return nil
     }
-    /// Narrowest content width at which the expanded toolbar fits (without volume, seek bar at its minimum).
-    static var minimumExpandedContentWidth: CGFloat { expandedFixedWidth(utilityCount: 2) + GlassMetrics.seekWidthMin + 2 * GlassMetrics.sideMargin }
+    /// Narrowest content width at which the expanded toolbar fits (narrowest utility set, seek bar at its minimum).
+    static func minimumExpandedContentWidth(includesInspector: Bool) -> CGFloat {
+        expandedFixedWidth(utilityCount: utilitySets(includesInspector: includesInspector).last!.count) + GlassMetrics.seekWidthMin + 2 * GlassMetrics.sideMargin
+    }
+    static var minimumExpandedContentWidth: CGFloat { minimumExpandedContentWidth(includesInspector: true) }
 
     /// NARROW WINDOWS: when the expanded toolbar cannot fit (content narrower than `GlassLayout.minimumExpandedContentWidth`), the layout falls back to the
     /// compact toolbar (play/pause + chevron) and `canExpand` is false: the integration must then HIDE or DISABLE the chevron (it could not do anything) and keep
@@ -134,7 +147,8 @@ struct GlassLayout: Equatable {
     /// item / shortcut). Recommended for the integration: give the playback window a minimum content width of `GlassLayout.minimumExpandedContentWidth` so the fallback is
     /// practically unreachable.
     /// `content`: the playback window's content size (fullscreen: the screen-sized content). Precondition: at least about 160 pt wide.
-    static func make(content: CGSize, fullscreen: Bool, expanded wantsExpanded: Bool, inspectorOpen: Bool) -> GlassLayout {
+    /// `includesInspector: false` leaves the inspector button out of the expanded toolbar (the production controls before the inspector exists).
+    static func make(content: CGSize, fullscreen: Bool, expanded wantsExpanded: Bool, inspectorOpen: Bool, includesInspector: Bool = true) -> GlassLayout {
         typealias M = GlassMetrics
         let bottom = fullscreen ? M.bottomMarginFullscreen : M.bottomMargin
         let centerY = bottom + M.transportSize / 2
@@ -144,7 +158,7 @@ struct GlassLayout: Equatable {
         var hidden: [GlassControl] = []
         var isExpanded = false
 
-        if wantsExpanded, let plan = expandedPlan(contentWidth: content.width) {
+        if wantsExpanded, let plan = expandedPlan(contentWidth: content.width, includesInspector: includesInspector) {
             let utility = plan.utility
             let seekW = plan.seekWidth
             let fixed = expandedFixedWidth(utilityCount: utility.count)
@@ -155,7 +169,7 @@ struct GlassLayout: Equatable {
             for c in utility { frames[c] = rect(M.utilitySize, M.utilitySize, x); x += M.utilitySize + M.buttonGap }
             x += M.groupGap - M.buttonGap
             frames[.expand] = rect(M.expandSize, M.expandSize, x)
-            hidden = utility.count == 3 ? [] : [.volume]
+            hidden = utilitySets(includesInspector: includesInspector).first!.filter { !utility.contains($0) }
             isExpanded = true
         }
         if !isExpanded {                                    // compact: play + chevron (also the fallback for very narrow windows)
@@ -177,7 +191,7 @@ struct GlassLayout: Equatable {
             }
         }
         let gradient = min(M.gradientHeightMax, content.height * M.gradientHeightFraction)
-        return GlassLayout(frames: frames, toolbar: toolbar, expanded: isExpanded, canExpand: expandedPlan(contentWidth: content.width) != nil, hidden: hidden, inspector: inspector, gradientHeight: gradient)
+        return GlassLayout(frames: frames, toolbar: toolbar, expanded: isExpanded, canExpand: expandedPlan(contentWidth: content.width, includesInspector: includesInspector) != nil, hidden: hidden, inspector: inspector, gradientHeight: gradient)
     }
 }
 
@@ -250,12 +264,14 @@ struct GlassPolicy: Equatable {
     var treatment: GlassTreatment
     var motion: GlassMotion
 
-    /// Starting-point values; measured over a pure white frame in the Motion Lab (white icons): clear + graphite tint 25 % + gradient 55 % = 6.2:1, the
-    /// same with 20 % tint and 50 % gradient on regular glass = 4.67:1. Treat as provisional until the user approves the look.
+    /// DEFAULT = native regular glass, no tint, a light readability gradient of 10 % (PROVISIONAL midpoint between 0 % and 20 %, chosen by the user after comparing 0 / 20 / 50 %).
+    /// KNOWN LIMITATION: contrast over bright video is BELOW accessibility targets in the default appearance. Measured over a pure WHITE frame (white icons on the glass behind them):
+    /// 1.90:1 at 0 %, 2.21:1 at 20 %, 3.38:1 at 50 % (10 %: see the milestone notes); over a pure black frame 15-17:1. Increase Contrast (regular + tint 35 % + gradient 70 %) and
+    /// Reduce Transparency (opaque graphite) are the fallbacks and reach >= 4.5:1 by modelled estimate.
     static func resolve(_ env: GlassEnvironment) -> GlassPolicy {
-        var t = GlassTreatment(surface: .glass, clearStyle: true, gradientOpacity: 0.55, tintOpacity: 0.25, hairlineOpacity: 0x24 / 255.0,
+        var t = GlassTreatment(surface: .glass, clearStyle: false, gradientOpacity: 0.10, tintOpacity: 0, hairlineOpacity: 0x24 / 255.0,
                                opaqueFill: .surface, primaryText: .text, secondaryText: .secondaryText)
-        if env.increaseContrast {                       // stronger scrim and edge, secondary text promoted to primary
+        if env.increaseContrast {                       // stronger scrim and tint, a stronger edge, secondary text promoted to primary
             t.gradientOpacity = 0.70; t.tintOpacity = 0.35; t.hairlineOpacity = 0.50; t.secondaryText = .text
         }
         if env.reduceTransparency {                     // no glass: an opaque graphite surface (stays dark in Light mode too)

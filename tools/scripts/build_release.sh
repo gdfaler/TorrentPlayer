@@ -3,7 +3,7 @@
 # - Builds the C++ core and the Swift app in an isolated directory under dist/ (never touches build/).
 # - Copies the non-system dynamic library closure into Contents/Frameworks and rewrites install names.
 # - Signs ad-hoc (NOT notarized; Gatekeeper will warn on other Macs), verifies the result, writes a dependency inventory.
-# Usage: tools/scripts/build_release.sh [output-name]     default output: dist/release
+# Usage: tools/scripts/build_release.sh [output-name]     default output: dist/release   (TP_BUILD_TESTING=1 additionally compiles the test-only GlassTestDriver)
 # Refuses to reuse an existing output directory; it never deletes anything.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -24,7 +24,8 @@ echo "== 2/6 app"
 mkdir -p "$OBJ" "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 clang -c -O2 -Wall -Wextra -Wno-unused-parameter -arch arm64 -mmacosx-version-min=27.0 -I core/include -I app/Sources -I /opt/homebrew/opt/mpv/include app/Sources/tp_mpv_bridge.c -o "$OBJ/tp_mpv_bridge.o"
 LT_LIBS=$(pkg-config --libs libtorrent-rasterbar)
-swiftc -O -swift-version 5 -target arm64-apple-macosx27.0 -module-name TorrentPlayer \
+TESTFLAG=(); [ "${TP_BUILD_TESTING:-}" = "1" ] && TESTFLAG=(-D TP_TESTING)      # testing builds only: compiles the env-gated GlassTestDriver (release builds contain no such hooks)
+swiftc -O -swift-version 5 -target arm64-apple-macosx27.0 -module-name TorrentPlayer ${TESTFLAG[@]+"${TESTFLAG[@]}"} \
   -import-objc-header app/Sources/bridge.h -Xcc -I$ROOT/core/include -Xcc -I$ROOT/app/Sources -Xcc -I/opt/homebrew/opt/mpv/include \
   app/Sources/*.swift "$OBJ/tp_mpv_bridge.o" "$CORE/libtpcore.a" \
   -L/opt/homebrew/opt/mpv/lib -lmpv $LT_LIBS -L/opt/homebrew/opt/openssl@3/lib -lssl -lcrypto -lc++ \

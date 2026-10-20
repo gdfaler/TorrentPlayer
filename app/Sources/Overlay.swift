@@ -86,6 +86,8 @@ final class SeekBar: NSView {
     var coverage: [UInt8] = [] { didSet { needsDisplay = true } }
     var onSeek: ((Double) -> Void)?
     var onScrub: ((Double) -> Void)?
+    var onStep: ((Double) -> Void)?                     // accessibility increment / decrement: seconds relative to the current position
+    var valueText = "0:00"                              // spoken value (the playback position)
     private(set) var dragging = false
     private var dragFraction = 0.0
     override var isFlipped: Bool { false }
@@ -96,10 +98,18 @@ final class SeekBar: NSView {
     override func mouseDragged(with e: NSEvent) { dragFraction = frac(e); onScrub?(dragFraction); needsDisplay = true }
     override func mouseUp(with e: NSEvent) { dragFraction = frac(e); dragging = false; fraction = dragFraction; onSeek?(dragFraction); needsDisplay = true }
 
+    // accessibility: a slider whose value is the playback position; increment / decrement step by 10 s
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .slider }
+    override func accessibilityLabel() -> String? { "Seek" }
+    override func accessibilityValue() -> Any? { valueText }
+    override func accessibilityPerformIncrement() -> Bool { onStep?(10); return onStep != nil }
+    override func accessibilityPerformDecrement() -> Bool { onStep?(-10); return onStep != nil }
+
     override func draw(_ dirtyRect: NSRect) {
         let trackH: CGFloat = 5, y = (bounds.height - trackH) / 2
         let track = NSRect(x: 6, y: y, width: bounds.width - 12, height: trackH)
-        NSColor(white: 1, alpha: 0.22).setFill(); NSBezierPath(roundedRect: track, xRadius: 2.5, yRadius: 2.5).fill()
+        NSColor(white: 1, alpha: 0.26).setFill(); NSBezierPath(roundedRect: track, xRadius: 2.5, yRadius: 2.5).fill()
         // cached (downloaded) bands
         if !coverage.isEmpty {
             NSColor(white: 1, alpha: 0.5).setFill()
@@ -112,47 +122,8 @@ final class SeekBar: NSView {
         }
         let f = dragging ? dragFraction : fraction
         let px = track.minX + CGFloat(f) * track.width
-        NSColor.controlAccentColor.setFill(); NSBezierPath(roundedRect: NSRect(x: track.minX, y: y, width: max(0, px - track.minX), height: trackH), xRadius: 2.5, yRadius: 2.5).fill()
-        NSColor.white.setFill(); NSBezierPath(ovalIn: NSRect(x: px - 6, y: bounds.midY - 6, width: 12, height: 12)).fill()
-    }
-}
-
-// MARK: transport controls
-final class ControlsView: NSView {
-    let playButton = NSButton()
-    let timeLabel = NSTextField(labelWithString: "0:00")
-    let durationLabel = NSTextField(labelWithString: "0:00")
-    let seekBar = SeekBar()
-    var onPlayPause: (() -> Void)?
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor(white: 0, alpha: 0.58).cgColor
-        layer?.cornerRadius = 12
-        playButton.bezelStyle = .regularSquare; playButton.isBordered = false
-        playButton.image = NSImage(systemSymbolName: "pause.fill", accessibilityDescription: "Pause")
-        playButton.contentTintColor = .white; playButton.target = self; playButton.action = #selector(tapped)
-        for l in [timeLabel, durationLabel] { l.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular); l.textColor = .white; l.alignment = .center }
-        [playButton, timeLabel, seekBar, durationLabel].forEach { addSubview($0) }
-    }
-    required init?(coder: NSCoder) { fatalError() }
-    @objc func tapped() { onPlayPause?() }
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func layout() {
-        super.layout()
-        let h = bounds.height, w = bounds.width
-        playButton.frame = NSRect(x: 12, y: (h - 28) / 2, width: 28, height: 28)
-        timeLabel.frame = NSRect(x: 46, y: (h - 16) / 2, width: 56, height: 16)
-        durationLabel.frame = NSRect(x: w - 70, y: (h - 16) / 2, width: 58, height: 16)
-        seekBar.frame = NSRect(x: 104, y: 0, width: max(40, w - 104 - 72), height: h)
-    }
-    func setPlaying(_ playing: Bool) {
-        playButton.image = NSImage(systemSymbolName: playing ? "pause.fill" : "play.fill", accessibilityDescription: playing ? "Pause" : "Play")
-    }
-    static func format(_ s: Double) -> String {
-        guard s.isFinite, s >= 0 else { return "0:00" }
-        let t = Int(s); let h = t / 3600, m = (t % 3600) / 60, sec = t % 60
-        return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
+        NSColor(srgbRed: 0xB7 / 255, green: 0xC4 / 255, blue: 0xD8 / 255, alpha: 1).setFill()      // Titanium accent (provisional token #B7C4D8)
+        NSBezierPath(roundedRect: NSRect(x: track.minX, y: y, width: max(0, px - track.minX), height: trackH), xRadius: 2.5, yRadius: 2.5).fill()
+        NSColor.white.setFill(); NSBezierPath(ovalIn: NSRect(x: px - 7, y: bounds.midY - 7, width: 14, height: 14)).fill()
     }
 }
