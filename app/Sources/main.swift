@@ -41,6 +41,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         buildMenu()
         controller = AppController(options: options)
         controller.window.makeKeyAndOrderFront(nil)
+#if TP_TESTING
+        HomeTestDriver.startIfRequested(controller)
+#endif
         NSApp.activate(ignoringOtherApps: true)
         NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(handleURLEvent(_:reply:)), forEventClass: AEEventClass(kInternetEventClass), andEventID: AEEventID(kAEGetURL))
         let early = openQueue.markReady()
@@ -83,11 +86,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case #selector(playbackControlsSize(_:)):
             guard let s = controller.session else { return false }
             return !s.isEnding && s.canToggleControlsSize
+        case #selector(setAppearance(_:)):
+            item.state = (item.representedObject as? String) == controller.home.appearancePreference.rawValue ? .on : .off
+            return true
         default: return true
         }
     }
 
     @objc func openDocument(_ s: Any?) { controller.chooseFile() }
+    @objc func openTorrentDocument(_ s: Any?) { controller.chooseTorrent() }
+    @objc func setAppearance(_ s: NSMenuItem) { if let a = HomeAppearance(rawValue: s.representedObject as? String ?? "") { controller.home.setAppearance(a) } }
     @objc func openMagnet(_ s: Any?) { controller.window.makeKeyAndOrderFront(nil); controller.pasteMagnet() }
     @objc func openRevealLogs(_ s: Any?) { NSWorkspace.shared.activateFileViewerSelecting([controller.telemetry.url]) }
 
@@ -101,6 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let fileItem = NSMenuItem(); main.addItem(fileItem)
         let file = NSMenu(title: "File"); fileItem.submenu = file
         file.addItem(withTitle: "Open…", action: #selector(openDocument(_:)), keyEquivalent: "o")
+        file.addItem(withTitle: "Open Torrent…", action: #selector(openTorrentDocument(_:)), keyEquivalent: "o").keyEquivalentModifierMask = [.command, .shift]
         let m = file.addItem(withTitle: "Open Magnet Link from Clipboard", action: #selector(openMagnet(_:)), keyEquivalent: "l")
         m.keyEquivalentModifierMask = [.command]
         file.addItem(.separator())
@@ -109,6 +118,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let viewItem = NSMenuItem(); main.addItem(viewItem)
         let view = NSMenu(title: "View"); viewItem.submenu = view
         view.addItem(withTitle: "Enter Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f").keyEquivalentModifierMask = [.command, .control]
+        view.addItem(.separator())
+        let appearanceItem = view.addItem(withTitle: "Home Appearance", action: nil, keyEquivalent: ""); let appearanceMenu = NSMenu(title: "Home Appearance"); appearanceItem.submenu = appearanceMenu
+        for a in HomeAppearance.allCases { let i = appearanceMenu.addItem(withTitle: a.title, action: #selector(setAppearance(_:)), keyEquivalent: ""); i.representedObject = a.rawValue; i.target = self }
         let playbackItem = NSMenuItem(); main.addItem(playbackItem)
         let playback = NSMenu(title: "Playback"); playbackItem.submenu = playback
         for (title, sel) in [("Play / Pause", #selector(playbackPlayPause(_:))), ("Back 10 Seconds", #selector(playbackBack10(_:))), ("Forward 10 Seconds", #selector(playbackForward10(_:))),

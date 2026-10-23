@@ -684,16 +684,19 @@ final class PlayerSession: NSObject {
                 return e
             default: break
             }
-            switch e.charactersIgnoringModifiers?.lowercased() {
-            case "f": self.toggleFullScreen(); return nil
-            case "m":
+            // letter shortcuts: never while text is being edited, never with Control / Option; the key is identified by the layout's Latin letter or, for non-Latin layouts, by its physical position
+            if NSApp.keyWindow?.firstResponder is NSText { return e }
+            guard PlaybackKey.modifiersAllowShortcut(command: false, control: e.modifierFlags.contains(.control), option: e.modifierFlags.contains(.option)) else { return e }
+            switch PlaybackKey.resolve(keyCode: e.keyCode, characters: e.charactersIgnoringModifiers) {
+            case .fullscreen: self.toggleFullScreen(); return nil
+            case .mute:
 #if TP_TESTING
                 LatencyProbe.trigger = "key"
 #endif
                 self.toggleMute(); return nil
-            case "e": self.controls.toggleExpanded(); return nil
-            case "r": if self.mpvError != nil { self.retry(); return nil }
-            default: break
+            case .expandCollapse: self.controls.toggleExpanded(); return nil
+            case .retry: if self.mpvError != nil { self.retry(); return nil }
+            case nil: break
             }
             return e
         }

@@ -99,9 +99,25 @@ final class GlassTestDriver {
         case "hide": controls.setVisible(false); log("hide", [:])
         case "show": controls.setVisible(true); log("show", [:])
         case "key":                                                     // a real key event through NSApp (reaches the player's key monitor)
-            let keys: [String: (UInt16, String)] = ["e": (14, "e"), "m": (46, "m"), "f": (3, "f"), "space": (49, " "), "up": (126, String(UnicodeScalar(NSUpArrowFunctionKey)!)), "down": (125, String(UnicodeScalar(NSDownArrowFunctionKey)!)), "left": (123, String(UnicodeScalar(NSLeftArrowFunctionKey)!)), "right": (124, String(UnicodeScalar(NSRightArrowFunctionKey)!))]
-            if let k = keys[arg], let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window?.windowNumber ?? 0, context: nil, characters: k.1, charactersIgnoringModifiers: k.1, isARepeat: false, keyCode: k.0) { NSApp.sendEvent(e) }
-            log("key", ["key": arg, "state": state(), "expanded": controls.expandedWanted])
+            // name -> (key code, characters, modifiers). ru_* simulate the Russian layout (same physical keys, Cyrillic characters); this is a SIMULATED event, not a real input source.
+            let arrow: (Int) -> String = { String(UnicodeScalar($0)!) }
+            let keys: [String: (UInt16, String, NSEvent.ModifierFlags)] = [
+                "e": (14, "e", []), "m": (46, "m", []), "f": (3, "f", []), "space": (49, " ", []), "up": (126, arrow(NSUpArrowFunctionKey), []), "down": (125, arrow(NSDownArrowFunctionKey), []),
+                "left": (123, arrow(NSLeftArrowFunctionKey), []), "right": (124, arrow(NSRightArrowFunctionKey), []),
+                "ru_e": (14, "у", []), "ru_m": (46, "ь", []), "ru_f": (3, "а", []), "ru_shift_m": (46, "Ь", .shift),
+                "ctrl_m": (46, "m", .control), "opt_m": (46, "µ", .option), "cmd_m": (46, "m", .command), "ru_ctrl_m": (46, "ь", .control), "shift_f": (3, "F", .shift),
+                "dvorak_m_pos_u": (3, "u", []),        // a Dvorak user's physical F-key position types "u": must NOT become full screen
+                "other_x": (7, "x", []), "ru_other": (7, "ч", [])]
+            if let k = keys[arg], let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: k.2, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: (NSApp.keyWindow ?? window)?.windowNumber ?? 0, context: nil, characters: k.1, charactersIgnoringModifiers: k.1.lowercased(), isARepeat: false, keyCode: k.0) { NSApp.sendEvent(e) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [self] in log("key", ["key": arg, "state": state(), "expanded": controls.expandedWanted]) }          // after mpv has reported the change
+        case "editfocus":                                               // an editable field takes the keyboard (as the magnet field does): letter shortcuts must not fire
+            if let w = window, let cv = w.contentView {
+                let f = NSTextField(frame: NSRect(x: 10, y: 10, width: 120, height: 22)); f.identifier = NSUserInterfaceItemIdentifier("tp_test_edit"); cv.addSubview(f)
+                log("editfocus", ["focused": w.makeFirstResponder(f), "isText": w.firstResponder is NSText])
+            }
+        case "unedit":
+            if let w = window, let f = w.contentView?.subviews.first(where: { $0.identifier?.rawValue == "tp_test_edit" }) { w.makeFirstResponder(w.contentView); f.removeFromSuperview() }
+            log("unedit", ["isText": window?.firstResponder is NSText])
         case "drag":                                                    // press on the seek bar and keep the button down (no release): the controls must not hide
             let a = arg.split(separator: ",").compactMap { Double($0) }
             guard a.count == 2 else { return }
