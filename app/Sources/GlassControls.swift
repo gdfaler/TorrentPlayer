@@ -82,10 +82,67 @@ final class GlassItemView: NSGlassEffectView {
 #endif
 }
 
+// MARK: button with pointer feedback
+/// A borderless toolbar button that reports its pressed state (the mouse-down tracking loop runs inside super.mouseDown).
+class GlassButton: NSButton {
+    var onPressChange: ((Bool) -> Void)?
+    override func mouseDown(with event: NSEvent) { onPressChange?(true); super.mouseDown(with: event); onPressChange?(false) }
+}
+
+/// The content of a round glass control: the button plus a white wash that fades in on hover and a little more while pressed (native tracking, no scaling, no springs). The glass view
+/// stays the animated view; this is only its content, so the morph is unaffected. The wash follows the policy's hover duration (instant under Reduce Motion).
+final class GlassItemContent: NSView {
+    let button: GlassButton
+    private let wash = CALayer()
+    private var hovered = false, pressed = false
+    var duration: CFTimeInterval = 0.12
+    private(set) var washOpacity: Float = 0
+
+    init(button: GlassButton, size: CGSize) {
+        self.button = button
+        super.init(frame: NSRect(origin: .zero, size: size))
+        wantsLayer = true
+        wash.backgroundColor = NSColor.white.cgColor; wash.opacity = 0
+        layer?.insertSublayer(wash, at: 0)
+        button.frame = bounds; button.autoresizingMask = [.width, .height]
+        addSubview(button)
+        button.onPressChange = { [weak self] on in self?.pressed = on; self?.update() }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        wash.frame = bounds; wash.cornerRadius = min(bounds.width, bounds.height) / 2
+        CATransaction.commit()
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for t in trackingAreas { removeTrackingArea(t) }
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) { setHovered(true) }
+    override func mouseExited(with event: NSEvent) { setHovered(false) }
+    func setHovered(_ on: Bool) { hovered = on; update() }
+    var isHovered: Bool { hovered }
+    var isPressed: Bool { pressed }
+
+    private func update() {
+        let target = Float(pressed ? GlassMetrics.pressWashOpacity : hovered ? GlassMetrics.hoverWashOpacity : 0)
+        washOpacity = target
+        let from = wash.presentation()?.opacity ?? wash.opacity
+        CATransaction.begin(); CATransaction.setDisableActions(true); wash.opacity = target; CATransaction.commit()
+        wash.removeAnimation(forKey: "wash")
+        guard duration > 0, from != target else { return }
+        let a = CABasicAnimation(keyPath: "opacity"); a.fromValue = from; a.toValue = target; a.duration = duration; a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        wash.add(a, forKey: "wash")
+    }
+}
+
 // MARK: the expand / collapse chevron
 /// ONE SF Symbol (chevron.up) drawn on its own layer and rotated 180 degrees between the states, so it turns together with the toolbar morph instead of being replaced by another
 /// symbol. The turn uses the same duration and easing as the frame animation; a new toggle starts from the angle currently on screen, so rapid toggles never snap.
-final class ChevronButton: NSButton {
+final class ChevronButton: GlassButton {
     private let glyph = CALayer()
     private(set) var targetExpanded = false
     private var configured = false
@@ -104,6 +161,8 @@ final class ChevronButton: NSButton {
     }
     required init?(coder: NSCoder) { fatalError() }
     override func layout() { super.layout(); CATransaction.begin(); CATransaction.setDisableActions(true); glyph.position = CGPoint(x: bounds.midX, y: bounds.midY); CATransaction.commit() }
+
+    func setShadow(opacity: Float, radius: CGFloat) { glyph.shadowColor = NSColor.black.cgColor; glyph.shadowOpacity = opacity; glyph.shadowRadius = radius; glyph.shadowOffset = CGSize(width: 0, height: -0.5) }
 
     /// Angle on screen right now (the presentation value while a turn is running).
     var currentAngle: CGFloat {
@@ -143,6 +202,7 @@ final class ControlsView: NSView {
     private let holder = NSView()
     private let seekRow = NSView()
     private var buttons: [GlassControl: NSButton] = [:]
+    private(set) var contents: [GlassControl: GlassItemContent] = [:]       // round controls only
     private(set) var chevron: ChevronButton!
     private var hideToken = 0
     private(set) var expandedShown = false
@@ -159,12 +219,13 @@ final class ControlsView: NSView {
         addSubview(container)
         func button(_ c: GlassControl, _ symbol: String, _ points: CGFloat, _ action: Selector) {
             let size = GlassMetrics.size(of: c)
-            let b = NSButton(frame: NSRect(origin: .zero, size: size))
+            let b = GlassButton(frame: NSRect(origin: .zero, size: size))
             b.isBordered = false; b.imagePosition = .imageOnly; b.target = self; b.action = action
             b.image = Self.symbol(symbol, points, c.accessibilityLabel); b.contentTintColor = Self.textColor
             b.identifier = NSUserInterfaceItemIdentifier(c.rawValue); b.setAccessibilityLabel(c.accessibilityLabel); b.toolTip = c.accessibilityLabel
             buttons[c] = b
-            let item = GlassItemView(control: c, content: b, size: size)
+            let content = GlassItemContent(button: b, size: size); contents[c] = content
+            let item = GlassItemView(control: c, content: content, size: size)
             items[c] = item; holder.addSubview(item)
         }
         button(.back10, GlassSymbol.back10, GlassMetrics.transportSymbolPoints, #selector(tapped(_:)))
@@ -178,7 +239,8 @@ final class ControlsView: NSView {
             b.target = self; b.action = #selector(tapped(_:)); b.contentTintColor = Self.textColor
             b.identifier = NSUserInterfaceItemIdentifier(c.rawValue); b.setAccessibilityLabel(c.accessibilityLabel); b.toolTip = c.accessibilityLabel
             buttons[c] = b; chevron = b
-            let item = GlassItemView(control: c, content: b, size: size)
+            let content = GlassItemContent(button: b, size: size); contents[c] = content
+            let item = GlassItemView(control: c, content: content, size: size)
             items[c] = item; holder.addSubview(item)
         }
         // seek capsule: time | seek bar | duration (the existing SeekBar: coverage bands, drag, release)
@@ -188,6 +250,7 @@ final class ControlsView: NSView {
         items[.seek] = seekItem; holder.addSubview(seekItem)
         seekRow.postsFrameChangedNotifications = true
         NotificationCenter.default.addObserver(self, selector: #selector(layoutSeekRow), name: NSView.frameDidChangeNotification, object: seekRow)
+        setAccessibilityRole(.group); setAccessibilityLabel("Playback controls")
         applyTreatment(GlassPolicy.resolve(GlassAccessibility.environment()).treatment)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -233,12 +296,29 @@ final class ControlsView: NSView {
         buttons[.volume]?.image = Self.symbol(GlassSymbol.mute(muted: muted), GlassMetrics.utilitySymbolPoints, label)
         buttons[.volume]?.setAccessibilityLabel(label); buttons[.volume]?.toolTip = label
     }
+#if TP_TESTING
+    var volumeAccessibilityLabel: String { buttons[.volume]?.accessibilityLabel() ?? "" }
+#endif
     func setFullscreen(_ fs: Bool) {
         let label = fs ? "Exit full screen" : "Enter full screen"
         buttons[.fullscreen]?.image = Self.symbol(GlassSymbol.fullscreen(isFullscreen: fs), GlassMetrics.utilitySymbolPoints, label)
         buttons[.fullscreen]?.setAccessibilityLabel(label); buttons[.fullscreen]?.toolTip = label
     }
-    func applyTreatment(_ t: GlassTreatment) { for i in items.values { i.apply(t) } }
+    func applyTreatment(_ t: GlassTreatment) {
+        for i in items.values { i.apply(t) }
+        var opacity = Float(t.iconShadowOpacity)
+#if TP_TESTING
+        if ProcessInfo.processInfo.environment["TP_FORCE_NO_ICON_TREATMENT"] != nil { opacity = 0 }      // before/after comparison of the icon shadow
+#endif
+        let radius = CGFloat(t.iconShadowRadius)
+        func shadow(_ l: CALayer?) { l?.shadowColor = NSColor.black.cgColor; l?.shadowOpacity = opacity; l?.shadowRadius = radius; l?.shadowOffset = CGSize(width: 0, height: -0.5) }
+        for b in buttons.values where !(b is ChevronButton) { b.wantsLayer = true; shadow(b.layer) }
+        chevron.setShadow(opacity: opacity, radius: radius)
+        for l in [timeLabel, durationLabel] { l.wantsLayer = true; shadow(l.layer) }
+        seekBar.shadowOpacity = CGFloat(opacity); seekBar.needsDisplay = true
+    }
+    /// Pointer feedback follows the policy (instant under Reduce Motion).
+    func applyMotion(_ m: GlassMotion) { for c in contents.values { c.duration = m.hoverDuration } }
 
     static func format(_ s: Double) -> String {
         guard s.isFinite, s >= 0 else { return "0:00" }
@@ -252,6 +332,7 @@ final class ControlsView: NSView {
     /// separately; with Reduce Motion every change is instant.
     func apply(layout: GlassLayout, origin: CGPoint, showsExpand: Bool, motion: GlassMotion, animated: Bool) {
         let on = layout.expanded
+        applyMotion(motion)
         let animate = animated && motion.animates
         hideToken += 1; let token = hideToken
         let collapseTo = (layout.frames[.play] ?? .zero).offsetBy(dx: -origin.x, dy: -origin.y)
@@ -269,7 +350,7 @@ final class ControlsView: NSView {
         let wasExpanded = expandedShown; expandedShown = on
         if layout.frames[.expand] != nil, showsExpand {                    // the chevron says what it will do and turns with the morph (same duration and easing)
             let label = on ? "Show fewer controls" : "Show more controls"
-            buttons[.expand]?.setAccessibilityLabel(label); buttons[.expand]?.toolTip = label
+            buttons[.expand]?.setAccessibilityLabel(label); buttons[.expand]?.toolTip = label; buttons[.expand]?.setAccessibilityExpanded(on)
             chevron.setExpanded(on, animated: animate && wasExpanded != on, duration: motion.expandDuration)
         }
         let frames: () -> Void = { for t in targets { if animate { t.item.animator().frame = t.frame } else { t.item.frame = t.frame } } }
@@ -341,6 +422,7 @@ final class GlassControls: NSObject {
         observers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main) { [weak self] _ in self?.refreshPolicy() })
         refreshPolicy()
 #if TP_TESTING
+        LatencyProbe.startGapMonitor()
         GlassTestDriver.startIfRequested(controls: self, window: w, state: { [weak self] in self?.testState() ?? [:] })
 #endif
     }

@@ -99,7 +99,7 @@ final class GlassTestDriver {
         case "hide": controls.setVisible(false); log("hide", [:])
         case "show": controls.setVisible(true); log("show", [:])
         case "key":                                                     // a real key event through NSApp (reaches the player's key monitor)
-            let keys: [String: (UInt16, String)] = ["e": (14, "e"), "m": (46, "m"), "f": (3, "f"), "space": (49, " "), "left": (123, String(UnicodeScalar(NSLeftArrowFunctionKey)!)), "right": (124, String(UnicodeScalar(NSRightArrowFunctionKey)!))]
+            let keys: [String: (UInt16, String)] = ["e": (14, "e"), "m": (46, "m"), "f": (3, "f"), "space": (49, " "), "up": (126, String(UnicodeScalar(NSUpArrowFunctionKey)!)), "down": (125, String(UnicodeScalar(NSDownArrowFunctionKey)!)), "left": (123, String(UnicodeScalar(NSLeftArrowFunctionKey)!)), "right": (124, String(UnicodeScalar(NSRightArrowFunctionKey)!))]
             if let k = keys[arg], let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window?.windowNumber ?? 0, context: nil, characters: k.1, charactersIgnoringModifiers: k.1, isARepeat: false, keyCode: k.0) { NSApp.sendEvent(e) }
             log("key", ["key": arg, "state": state(), "expanded": controls.expandedWanted])
         case "drag":                                                    // press on the seek bar and keep the button down (no release): the controls must not hide
@@ -119,6 +119,31 @@ final class GlassTestDriver {
             sequence(a[0], frames: n, interval: ms / 1000)
         case "contrast": contrast(arg)
         case "dump": dump(arg)
+        case "hover", "unhover":                                       // sets the hover state directly (a synthetic move cannot create the system's tracking-area enter event)
+            if let c = control(arg) { controls.view.contents[c]?.setHovered(cmd == "hover") }
+            log(cmd, ["target": arg])
+        case "pressdown":                                              // mouse-down only (the button tracks inside a nested loop until pressup)
+            if let c = control(arg), let p = centre(of: c) { NSApp.postEvent(event(.leftMouseDown, p), atStart: false) }
+            log(cmd, ["target": arg])
+        case "pressup":
+            if let c = control(arg), let p = centre(of: c) { NSApp.postEvent(event(.leftMouseUp, p), atStart: false) }
+            log(cmd, ["target": arg])
+        case "menu":                                                   // performs a Playback / View menu item by title (keyboard / VoiceOver path)
+            var done = false, enabled = false
+            for top in NSApp.mainMenu?.items ?? [] { for it in top.submenu?.items ?? [] where it.title == arg {
+                enabled = (NSApp.delegate as? NSMenuItemValidation)?.validateMenuItem(it) ?? it.isEnabled
+                if enabled { NSApp.sendAction(it.action!, to: it.target, from: it); done = true }
+            } }
+            log("menu", ["title": arg, "enabled": enabled, "performed": done])
+        case "menuperform":                                            // AppKit's own simulation of choosing the item (NSMenu.performActionForItem), for timing against sendAction
+            var done = false
+            for top in NSApp.mainMenu?.items ?? [] { if let m = top.submenu, let i = m.items.firstIndex(where: { $0.title == arg }) { m.performActionForItem(at: i); done = true } }
+            log("menuperform", ["title": arg, "performed": done])
+        case "menustate":
+            var st: [String: Bool] = [:]
+            for top in NSApp.mainMenu?.items ?? [] where top.submenu?.title == "Playback" { for it in top.submenu?.items ?? [] { st[it.title] = (NSApp.delegate as? NSMenuItemValidation)?.validateMenuItem(it) ?? it.isEnabled } }
+            log("menustate", ["items": st, "menus": (NSApp.mainMenu?.items ?? []).compactMap { $0.submenu?.title }])
+        case "iconcontrast": iconContrast(arg)
         case "probe": probe(arg)
         case "capture": capture(arg)
         default: log("unknown", ["cmd": cmd])
@@ -129,7 +154,14 @@ final class GlassTestDriver {
         var items: [String: Any] = [:]
         for (c, i) in controls.view.items {
             let p = centre(of: c)
-            items[c.rawValue] = ["hidden": i.isHidden, "contentAlpha": Double(i.content.alphaValue), "frame": "\(i.frame)", "showsGlass": i.isShowingGlass, "debug": i.debugInfo, "hitAtCentre": p.map { hitName(at: $0) } ?? "-"]
+            let cont = controls.view.contents[c]
+            var d: [String: Any] = ["hidden": i.isHidden, "contentAlpha": Double(i.content.alphaValue), "frame": "\(i.frame)", "showsGlass": i.isShowingGlass, "debug": i.debugInfo]
+            d["hitAtCentre"] = p.map { hitName(at: $0) } ?? "-"
+            d["wash"] = Double(cont?.washOpacity ?? 0); d["washDuration"] = Double(cont?.duration ?? -1); d["hovered"] = cont?.isHovered ?? false; d["pressed"] = cont?.isPressed ?? false
+            d["tracking"] = cont?.trackingAreas.count ?? -1; d["shadow"] = Double(cont?.button.layer?.shadowOpacity ?? -1)
+            d["a11yLabel"] = (c == .seek ? controls.view.seekBar.accessibilityLabel() : cont?.button.accessibilityLabel()) ?? ""
+            d["a11yExpanded"] = cont?.button.isAccessibilityExpanded() ?? false
+            items[c.rawValue] = d
         }
         let l = controls.layout
         log("probe", ["name": name, "items": items, "expanded": l?.expanded ?? false, "canExpand": l?.canExpand ?? false, "hiddenByWidth": (l?.hidden ?? []).map { $0.rawValue }, "toolbar": l.map { "\($0.toolbar)" } ?? "-",
@@ -138,7 +170,7 @@ final class GlassTestDriver {
                       "contentMin": window.map { "\($0.contentMinSize)" } ?? "-", "fullscreen": window?.styleMask.contains(.fullScreen) ?? false, "shown": controls.shown,
                       "panelAppearance": controls.panel.effectiveAppearance.name.rawValue, "windowAppearance": window?.effectiveAppearance.name.rawValue ?? "-",
                       "surface": controls.policy.treatment.surface == .glass ? "glass" : "opaque", "animates": controls.policy.motion.animates, "gradientOpacity": controls.policy.treatment.gradientOpacity,
-                      "hairline": controls.policy.treatment.hairlineOpacity, "state": state(), "counts": counts(),
+                      "hairline": controls.policy.treatment.hairlineOpacity, "state": state(), "counts": counts(), "stall_ms": LatencyProbe.stallSinceLastProbeMs(), "seekA11y": ["role": controls.view.seekBar.accessibilityRole()?.rawValue ?? "", "value": "\(controls.view.seekBar.accessibilityValue() ?? "")", "label": controls.view.seekBar.accessibilityLabel() ?? ""], "groupLabel": controls.view.accessibilityLabel() ?? "", "timeShadow": Double(controls.view.timeLabel.layer?.shadowOpacity ?? -1),
                       "chevron": ["target": Double(controls.view.chevron.targetAngle), "angle": Double(controls.view.chevron.currentAngle), "turning": controls.view.chevron.isTurning, "title": controls.view.chevron.title, "hasImage": controls.view.chevron.image != nil]])
     }
 
@@ -164,6 +196,33 @@ final class GlassTestDriver {
             per[c.rawValue] = (r * 100).rounded() / 100; minC = min(minC, r)
         }
         log("contrast", ["name": name, "min": (minC * 100).rounded() / 100, "per_control": per])
+    }
+
+    /// Local contrast of each round icon against its immediate surroundings (rendered pixels): the mean linear luma of the bright glyph pixels vs the mean of a thin ring just outside
+    /// them. The patch-based `contrast` above samples glass away from the icon and cannot see a shadow; this one can.
+    private func iconContrast(_ name: String) {
+        guard let img = grab(controls.panel.frame) else { return }
+        let pf = controls.panel.frame, sx = Double(img.width) / Double(pf.width), sy = Double(img.height) / Double(pf.height)
+        guard let ctx = CGContext(data: nil, width: img.width, height: img.height, bitsPerComponent: 8, bytesPerRow: img.width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue), let px = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return }
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: img.width, height: img.height))
+        func lin(_ c: Double) -> Double { c <= 0.03928 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4) }
+        func L(_ x: Int, _ y: Int) -> Double { let o = (y * img.width + x) * 4; return 0.2126 * lin(Double(px[o]) / 255) + 0.7152 * lin(Double(px[o + 1]) / 255) + 0.0722 * lin(Double(px[o + 2]) / 255) }
+        var per: [String: Double] = [:], minC = 99.0
+        for (c, i) in controls.view.items where c != .seek && c != .expand && !i.isHidden && i.content.alphaValue > 0.5 {
+            let f = i.convert(i.bounds, to: controls.panel.contentView)
+            let cx = Int(f.midX * sx), cy = Int((Double(pf.height) - f.midY) * sy), r = Int(f.width * 0.34 * sx)
+            guard cx - r - 8 >= 0, cy - r - 8 >= 0, cx + r + 8 < img.width, cy + r + 8 < img.height else { continue }
+            var glyph = Set<Int>(), glyphSum = 0.0
+            for y in (cy - r)...(cy + r) { for x in (cx - r)...(cx + r) where L(x, y) > 0.8 { glyph.insert(y * img.width + x); glyphSum += L(x, y) } }
+            guard glyph.count > 20 else { continue }
+            var ring = Set<Int>(), ringSum = 0.0
+            for g in glyph { let gx = g % img.width, gy = g / img.width
+                for dy in -5...5 { for dx in -5...5 where abs(dx) + abs(dy) >= 3 && abs(dx) + abs(dy) <= 5 { let k = (gy + dy) * img.width + gx + dx; if !glyph.contains(k) && !ring.contains(k) { ring.insert(k); ringSum += L(gx + dx, gy + dy) } } } }
+            guard !ring.isEmpty else { continue }
+            let gm = glyphSum / Double(glyph.count), rm = ringSum / Double(ring.count), ratio = (max(gm, rm) + 0.05) / (min(gm, rm) + 0.05)
+            per[c.rawValue] = (ratio * 100).rounded() / 100; minC = min(minC, ratio)
+        }
+        log("iconcontrast", ["name": name, "min": (minC * 100).rounded() / 100, "per_control": per])
     }
 
     private func dump(_ name: String) {
@@ -221,6 +280,44 @@ final class GlassTestDriver {
         ctx.draw(raw, in: CGRect(x: 0, y: 0, width: raw.width, height: raw.height))                // the window-server image is lazily backed: copy it at once
         if let img = ctx.makeImage(), let d = NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:]) { try? d.write(to: URL(fileURLWithPath: dir + "/" + name + ".png")) }
         log("capture", ["name": name])
+    }
+}
+
+/// Latency probe (testing builds only): input -> action -> mpv state -> toolbar icon for the shared mute path, plus the longest main-thread stall in between.
+enum LatencyProbe {
+    private static var inputT = 0.0, actionT = 0.0, dispatchedT = 0.0, stateT = 0.0, maxGap = 0.0, lastTick = 0.0
+    private static var timer: Timer?
+    static var now: Double { ProcessInfo.processInfo.systemUptime }
+    /// A 5 ms timer measures how long the main run loop was unavailable (a stalled main thread shows up as a large gap).
+    static func startGapMonitor() {
+        guard timer == nil else { return }
+        lastTick = now
+        timer = Timer.scheduledTimer(withTimeInterval: 0.005, repeats: true) { _ in let t = now; let g = t - lastTick - 0.005; maxGap = max(maxGap, g); overallGap = max(overallGap, g); lastTick = t }
+        RunLoop.main.add(timer!, forMode: .common)
+    }
+    private static var overallGap = 0.0
+    /// Longest main-run-loop stall since the previous call (ms): the driver's probe reports it.
+    static func stallSinceLastProbeMs() -> Double { let g = max(overallGap, maxGap); overallGap = 0; return (g * 10000).rounded() / 10 }
+    static func action(input: TimeInterval?) { eventType = NSApp.currentEvent.map { Int($0.type.rawValue) } ?? -1; overallGap = max(overallGap, maxGap); actionT = now; inputT = input ?? actionT; maxGap = 0 }
+    static func dispatched() { dispatchedT = now }
+    static var trigger = "unknown"                       // which input invoked the action: button / key / menu
+    static var eventType = -1                            // type of the AppKit event being dispatched when the action ran (menu selections arrive as the mouse-up that chose the item)
+    // volume
+    private static var vInputT = 0.0, vActionT = 0.0, vPath = ""
+    static func volumeAction(input: TimeInterval?) { vActionT = now; vInputT = input ?? vActionT }
+    static func volumePath(_ p: String) { vPath = p }
+    static func volumeState(emit: (String, [String: Any]) -> Void, ao: Double, soft: Double) {
+        guard vActionT > 0 else { return }
+        let t = now
+        emit("volume_latency", ["input_to_action_ms": ((vActionT - vInputT) * 10000).rounded() / 10, "action_to_state_ms": ((t - vActionT) * 10000).rounded() / 10, "path": vPath, "ao_volume": ao, "soft_volume": soft])
+        vActionT = 0
+    }
+    static func state() { stateT = now }
+    static func ui(_ emit: (String, [String: Any]) -> Void, value: Bool, icon: String, source: String) {
+        let t = now
+        func ms(_ a: Double, _ b: Double) -> Double { ((b - a) * 10000).rounded() / 10 }
+        emit("mute_latency", ["input_to_action_ms": ms(inputT, actionT), "command_dispatch_ms": ms(actionT, dispatchedT), "action_to_mpv_state_ms": ms(actionT, stateT), "state_to_ui_ms": ms(stateT, t),
+                              "total_ms": ms(inputT, t), "max_main_thread_gap_ms": (maxGap * 10000).rounded() / 10, "muted": value, "icon_label": icon, "source": source, "trigger": trigger, "event_type": eventType])
     }
 }
 #endif

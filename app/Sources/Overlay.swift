@@ -87,7 +87,8 @@ final class SeekBar: NSView {
     var onSeek: ((Double) -> Void)?
     var onScrub: ((Double) -> Void)?
     var onStep: ((Double) -> Void)?                     // accessibility increment / decrement: seconds relative to the current position
-    var valueText = "0:00"                              // spoken value (the playback position)
+    var valueText = "0:00"                              // spoken value ("elapsed of total")
+    var shadowOpacity: CGFloat = 0                      // soft shadow behind the knob (local contrast on bright video)
     private(set) var dragging = false
     private var dragFraction = 0.0
     override var isFlipped: Bool { false }
@@ -124,6 +125,9 @@ final class SeekBar: NSView {
         let px = track.minX + CGFloat(f) * track.width
         NSColor(srgbRed: 0xB7 / 255, green: 0xC4 / 255, blue: 0xD8 / 255, alpha: 1).setFill()      // Titanium accent (provisional token #B7C4D8)
         NSBezierPath(roundedRect: NSRect(x: track.minX, y: y, width: max(0, px - track.minX), height: trackH), xRadius: 2.5, yRadius: 2.5).fill()
+        NSGraphicsContext.saveGraphicsState()
+        if shadowOpacity > 0 { let sh = NSShadow(); sh.shadowColor = NSColor(white: 0, alpha: shadowOpacity); sh.shadowBlurRadius = 2.5; sh.shadowOffset = NSSize(width: 0, height: -0.5); sh.set() }
         NSColor.white.setFill(); NSBezierPath(ovalIn: NSRect(x: px - 7, y: bounds.midY - 7, width: 14, height: 14)).fill()
+        NSGraphicsContext.restoreGraphicsState()
     }
 }

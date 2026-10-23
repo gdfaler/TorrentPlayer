@@ -151,6 +151,16 @@ import CoreGraphics
         check(!rm.motion.animates && rm.motion.expandDuration == 0 && rm.motion.iconFadeDuration == 0 && rm.motion.iconFadeDelay == 0 && rm.motion.iconCollapseFadeDuration == 0 && rm.motion.revealDuration == 0 && rm.motion.inspectorDuration == 0, "Reduce Motion: every duration 0")
         check(rm.treatment == base.treatment, "Reduce Motion does not change the surface treatment")
 
+        // 5b. pointer feedback and the icon shadow (Milestone 2B)
+        check(base.motion.hoverDuration >= 0.08 && base.motion.hoverDuration <= 0.25 && rm.motion.hoverDuration == 0, "hover / pressed wash: restrained duration, instant under Reduce Motion")
+        check(M.hoverWashOpacity > 0 && M.hoverWashOpacity < M.pressWashOpacity && M.pressWashOpacity <= 0.3, "hover wash is subtler than the pressed wash, both restrained")
+        check(base.treatment.iconShadowOpacity > 0 && base.treatment.iconShadowOpacity <= 0.8 && base.treatment.iconShadowRadius <= 3, "default: subtle icon shadow (not heavy)")
+        let icx = GlassPolicy.resolve(GlassEnvironment(increaseContrast: true)).treatment, rtx = GlassPolicy.resolve(GlassEnvironment(reduceTransparency: true)).treatment
+        check(icx.iconShadowOpacity > base.treatment.iconShadowOpacity, "Increase Contrast: stronger icon shadow than the default")
+        check(rtx.iconShadowOpacity == 0 && rtx.surface == .opaque, "Reduce Transparency: opaque surface, no icon shadow")
+        check(base.treatment != icx && base.treatment != rtx && icx != rtx, "default, Increase Contrast and Reduce Transparency stay distinct treatments")
+        check(M.timeFont.weight == .semibold && M.timeFont.monospacedDigits, "time labels: semibold tabular digits")
+
         // 6. accessibility: Reduce Transparency -> opaque fallback; Increase Contrast -> stronger
         check(base.treatment.surface == .glass, "default surface is glass")
         let rt = GlassPolicy.resolve(GlassEnvironment(reduceTransparency: true))

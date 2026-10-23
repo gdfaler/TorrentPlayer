@@ -32,7 +32,7 @@ func parseOptions() -> AppOptions {
     return o
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     let options = parseOptions()
     var controller: AppController!
     var openQueue = OpenQueue()                      // open requests that arrive before the controller exists (Finder "Open With" on a cold launch)
@@ -63,6 +63,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     func applicationShouldHandleReopen(_ app: NSApplication, hasVisibleWindows flag: Bool) -> Bool { if !flag { controller.window.makeKeyAndOrderFront(nil) }; return true }
 
+    // Playback menu: every toolbar action is also reachable from the menu bar (keyboard and VoiceOver), without focusing the non-activating controls panel. No key equivalents: the
+    // player's own keys (Space, arrows, M, F, E) stay as they are.
+    @objc func playbackPlayPause(_ s: Any?) { controller.session?.togglePause() }
+    @objc func playbackBack10(_ s: Any?) { controller.session?.seekRelative(-10) }
+    @objc func playbackForward10(_ s: Any?) { controller.session?.seekRelative(10) }
+    @objc func playbackMute(_ s: Any?) {
+#if TP_TESTING
+        LatencyProbe.trigger = "menu"
+#endif
+        controller.session?.toggleMute()
+    }
+    @objc func playbackControlsSize(_ s: Any?) { controller.session?.toggleControlsSize() }
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(playbackPlayPause(_:)), #selector(playbackBack10(_:)), #selector(playbackForward10(_:)), #selector(playbackMute(_:)):
+            guard let s = controller.session else { return false }
+            return !s.isEnding && s.playbackStarted
+        case #selector(playbackControlsSize(_:)):
+            guard let s = controller.session else { return false }
+            return !s.isEnding && s.canToggleControlsSize
+        default: return true
+        }
+    }
+
     @objc func openDocument(_ s: Any?) { controller.chooseFile() }
     @objc func openMagnet(_ s: Any?) { controller.window.makeKeyAndOrderFront(nil); controller.pasteMagnet() }
     @objc func openRevealLogs(_ s: Any?) { NSWorkspace.shared.activateFileViewerSelecting([controller.telemetry.url]) }
@@ -85,6 +109,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let viewItem = NSMenuItem(); main.addItem(viewItem)
         let view = NSMenu(title: "View"); viewItem.submenu = view
         view.addItem(withTitle: "Enter Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f").keyEquivalentModifierMask = [.command, .control]
+        let playbackItem = NSMenuItem(); main.addItem(playbackItem)
+        let playback = NSMenu(title: "Playback"); playbackItem.submenu = playback
+        for (title, sel) in [("Play / Pause", #selector(playbackPlayPause(_:))), ("Back 10 Seconds", #selector(playbackBack10(_:))), ("Forward 10 Seconds", #selector(playbackForward10(_:))),
+                             ("Mute / Unmute", #selector(playbackMute(_:))), ("Show More / Fewer Controls", #selector(playbackControlsSize(_:)))] {
+            playback.addItem(withTitle: title, action: sel, keyEquivalent: "").target = self
+        }
         NSApp.mainMenu = main
     }
 }

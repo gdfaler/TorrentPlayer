@@ -78,10 +78,13 @@ enum GlassMetrics {
     static let gradientHeightMax: CGFloat = 300, gradientHeightFraction: CGFloat = 0.45
     // symbols and type
     static let transportSymbolPoints: CGFloat = 21, utilitySymbolPoints: CGFloat = 17, expandSymbolPoints: CGFloat = 15
-    static let timeFont = GlassFont(size: 11, weight: .medium, monospacedDigits: true)
+    static let timeFont = GlassFont(size: 11, weight: .semibold, monospacedDigits: true)
     static let inspectorTitleFont = GlassFont(size: 15, weight: .semibold, monospacedDigits: false)
     static let inspectorLabelFont = GlassFont(size: 12, weight: .regular, monospacedDigits: false)
     static let inspectorValueFont = GlassFont(size: 12, weight: .medium, monospacedDigits: true)
+
+    // pointer feedback on the round buttons: a white wash over the glass (hover, pressed); restrained, no scaling, no springs (the system adds its own press response to interactive glass)
+    static let hoverWashOpacity: Double = 0.10, pressWashOpacity: Double = 0.20
 
     static func cornerRadius(for size: CGSize) -> CGFloat { min(size.width, size.height) / 2 }
     static func size(of c: GlassControl) -> CGSize {
@@ -230,6 +233,8 @@ struct GlassTreatment: Equatable {
     var gradientOpacity: Double          // graphite gradient under the controls (strongest at the bottom edge)
     var tintOpacity: Double              // graphite tint inside the glass
     var hairlineOpacity: Double          // white edge line
+    var iconShadowOpacity: Double        // soft dark shadow behind icons, labels and the seek knob (local contrast; the glass itself is untouched); 0 on opaque surfaces
+    var iconShadowRadius: Double
     var opaqueFill: GlassRGB             // fill used when surface == .opaque
     var primaryText: GlassRGB
     var secondaryText: GlassRGB
@@ -255,7 +260,8 @@ struct GlassTreatment: Equatable {
 struct GlassMotion: Equatable {
     var expandDuration: Double           // compact <-> expanded (approved 380 ms)
     var iconFadeDuration: Double, iconFadeDelay: Double, iconCollapseFadeDuration: Double
-    var revealDuration: Double           // controls show / hide, hover
+    var revealDuration: Double           // controls show / hide
+    var hoverDuration: Double            // hover / pressed wash on the buttons
     var inspectorDuration: Double
     var animates: Bool { expandDuration > 0 }
 }
@@ -270,17 +276,17 @@ struct GlassPolicy: Equatable {
     /// Reduce Transparency (opaque graphite) are the fallbacks and reach >= 4.5:1 by modelled estimate.
     static func resolve(_ env: GlassEnvironment) -> GlassPolicy {
         var t = GlassTreatment(surface: .glass, clearStyle: false, gradientOpacity: 0.10, tintOpacity: 0, hairlineOpacity: 0x24 / 255.0,
-                               opaqueFill: .surface, primaryText: .text, secondaryText: .secondaryText)
+                               iconShadowOpacity: 0.75, iconShadowRadius: 2.5, opaqueFill: .surface, primaryText: .text, secondaryText: .secondaryText)
         if env.increaseContrast {                       // stronger scrim and tint, a stronger edge, secondary text promoted to primary
-            t.gradientOpacity = 0.70; t.tintOpacity = 0.35; t.hairlineOpacity = 0.50; t.secondaryText = .text
+            t.gradientOpacity = 0.70; t.tintOpacity = 0.35; t.hairlineOpacity = 0.50; t.secondaryText = .text; t.iconShadowOpacity = 0.90; t.iconShadowRadius = 3.0
         }
         if env.reduceTransparency {                     // no glass: an opaque graphite surface (stays dark in Light mode too)
-            t.surface = .opaque
+            t.surface = .opaque; t.iconShadowOpacity = 0                  // an opaque surface needs no shadow: its contrast is >= 4.5:1
         }
         if t.surface == .glass { t.secondaryText = .text }      // no dimmed text on glass: the video behind it is unknown
         let m: GlassMotion = env.reduceMotion
-            ? GlassMotion(expandDuration: 0, iconFadeDuration: 0, iconFadeDelay: 0, iconCollapseFadeDuration: 0, revealDuration: 0, inspectorDuration: 0)
-            : GlassMotion(expandDuration: 0.38, iconFadeDuration: 0.22, iconFadeDelay: 0.14, iconCollapseFadeDuration: 0.12, revealDuration: 0.20, inspectorDuration: 0.30)
+            ? GlassMotion(expandDuration: 0, iconFadeDuration: 0, iconFadeDelay: 0, iconCollapseFadeDuration: 0, revealDuration: 0, hoverDuration: 0, inspectorDuration: 0)
+            : GlassMotion(expandDuration: 0.38, iconFadeDuration: 0.22, iconFadeDelay: 0.14, iconCollapseFadeDuration: 0.12, revealDuration: 0.20, hoverDuration: 0.12, inspectorDuration: 0.30)
         return GlassPolicy(treatment: t, motion: m)
     }
 }

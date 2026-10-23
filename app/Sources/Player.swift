@@ -39,7 +39,11 @@ final class PlayerSession: NSObject {
 
     // ---- observed mpv state (main thread only)
     private(set) var timePos = 0.0, duration = 0.0
-    private var muted = false
+    private var muted = false                            // mpv `mute`: software gain in the filter chain (audible only after the audio already queued in the output has played)
+    private var aoMuted = false, aoMuteAvailable = false // mpv `ao-mute`: the audio output's own mute (immediate); available once an output that supports it is open
+    private var softVolume = 100.0                       // mpv `volume`: software gain (0...130)
+    private var aoVolume = 100.0, aoVolumeAvailable = false   // mpv `ao-volume`: the audio output's own volume (0...100), when the output has one
+    private var isMuted: Bool { muted || aoMuted }       // what the toolbar shows: both are mpv's own state, nothing is kept or guessed here
     private var paused = false, pausedForCache = false, seeking = false, coreIdle = true
     private var demuxerBufferS: Double?                  // mpv `demuxer-cache-duration`; nil while mpv reports it unavailable
     private(set) var playbackStarted = false
@@ -79,11 +83,16 @@ final class PlayerSession: NSObject {
         banner.contentView = bannerView
         controlsView.onPlayPause = { [weak self] in self?.togglePause() }
 #if TP_TESTING
-        controls.testState = { [weak self] in guard let s = self else { return [:] }; return ["paused": s.paused, "muted": s.muted, "time_pos": s.timePos, "fullscreen": s.mpvWindow?.styleMask.contains(.fullScreen) ?? false] }
+        controls.testState = { [weak self] in guard let s = self else { return [:] }; return ["paused": s.paused, "muted": s.isMuted, "mpv_mute": s.mpvMuteNow(), "mpv_ao_mute": s.mpvAOMuteNow(), "mpv_volume": s.mpvPropNow("volume"), "mpv_ao_volume": s.mpvPropNow("ao-volume"), "ao_volume_available": s.aoVolumeAvailable, "ao_mute_available": s.aoMuteAvailable, "time_pos": s.timePos, "fullscreen": s.mpvWindow?.styleMask.contains(.fullScreen) ?? false] }
 #endif
         controlsView.onBack10 = { [weak self] in self?.seekRelative(-10) }
         controlsView.onFwd10 = { [weak self] in self?.seekRelative(10) }
-        controlsView.onMute = { [weak self] in self?.toggleMute() }
+        controlsView.onMute = { [weak self] in
+#if TP_TESTING
+            LatencyProbe.trigger = "button"
+#endif
+            self?.toggleMute()
+        }
         controlsView.onFullscreen = { [weak self] in self?.toggleFullScreen() }
         controlsView.onToggleExpanded = { [weak self] in self?.controls.toggleExpanded() }
         controlsView.seekBar.onStep = { [weak self] d in self?.seekRelative(d) }
@@ -140,7 +149,7 @@ final class PlayerSession: NSObject {
             if settings.mute { opt("mute", "yes") }
             if mpv_initialize(h) < 0 { DispatchQueue.main.async { self?.fail("Could not initialise the video player (mpv).") }; mpv_destroy(h); return }
             for (n, f) in [("time-pos", MPV_FORMAT_DOUBLE), ("duration", MPV_FORMAT_DOUBLE), ("pause", MPV_FORMAT_FLAG), ("paused-for-cache", MPV_FORMAT_FLAG),
-                           ("seeking", MPV_FORMAT_FLAG), ("core-idle", MPV_FORMAT_FLAG), ("mute", MPV_FORMAT_FLAG), ("volume", MPV_FORMAT_DOUBLE),
+                           ("seeking", MPV_FORMAT_FLAG), ("core-idle", MPV_FORMAT_FLAG), ("mute", MPV_FORMAT_FLAG), ("ao-mute", MPV_FORMAT_FLAG), ("volume", MPV_FORMAT_DOUBLE),
                            ("demuxer-cache-duration", MPV_FORMAT_DOUBLE)] { mpv_observe_property(h, 0, n, f) }
             mpv_request_log_messages(h, "warn")
             let rc = s.map { tpb_register(h, $0.ptr) } ?? 0
@@ -196,16 +205,28 @@ final class PlayerSession: NSObject {
             guard let d = ev.pointee.data else { return }
             let p = d.assumingMemoryBound(to: mpv_event_property.self).pointee
             let name = String(cString: p.name)
-            if p.format == MPV_FORMAT_NONE { if name == "demuxer-cache-duration" { demuxerBufferS = nil }; return }   // property became unavailable
+            if p.format == MPV_FORMAT_NONE {
+                if name == "demuxer-cache-duration" { demuxerBufferS = nil }
+                if name == "ao-mute" { aoMuteAvailable = false; aoMuted = false; controlsView.setMuted(isMuted) }          // no output (or one without mute control): software mute only
+                return
+            }   // property became unavailable
             guard let data = p.data else { return }
             if p.format == MPV_FORMAT_DOUBLE {
                 let v = data.assumingMemoryBound(to: Double.self).pointee
-                if name == "demuxer-cache-duration" { demuxerBufferS = v } else if name == "time-pos" { timePos = v; if let c = seekTracker.positionUpdated(v) { emitSeekDone(c) } } else if name == "duration" { if v > 0 && duration != v { duration = v; durationKnown() } }
+                if name == "demuxer-cache-duration" { demuxerBufferS = v } else if name == "volume" { softVolume = v } else if name == "time-pos" { timePos = v; if let c = seekTracker.positionUpdated(v) { emitSeekDone(c) } } else if name == "duration" { if v > 0 && duration != v { duration = v; durationKnown() } }
             } else if p.format == MPV_FORMAT_FLAG {
                 let v = data.assumingMemoryBound(to: Int32.self).pointee != 0
                 switch name {
                 case "pause": paused = v; controlsView.setPlaying(!v)
-                case "mute": muted = v; controlsView.setMuted(v)
+                case "mute", "ao-mute":
+#if TP_TESTING
+                    LatencyProbe.state()
+#endif
+                    if name == "mute" { muted = v } else { aoMuted = v; aoMuteAvailable = true }
+                    controlsView.setMuted(isMuted)
+#if TP_TESTING
+                    LatencyProbe.ui({ [telemetry] k, f in telemetry.emit(k, f) }, value: isMuted, icon: controlsView.volumeAccessibilityLabel, source: name)
+#endif
                 case "paused-for-cache": setPausedForCache(v)
                 case "seeking": seeking = v
                 case "core-idle": coreIdle = v
@@ -225,7 +246,11 @@ final class PlayerSession: NSObject {
             }
             // Completes the pending seek only when mpv reported that seek's start; `seek_done` is written once the position after the restart is known.
             if let lat = seekTracker.restarted(now: telemetry.now) { seekLatencies.append(lat) }
+        case MPV_EVENT_AUDIO_RECONFIG:
+            queryAOMute(); queryAOVolume()                  // an audio output was (re)opened: does it have its own mute and volume?
         case MPV_EVENT_GET_PROPERTY_REPLY:
+            if ev.pointee.reply_userdata == PlayerSession.aoMuteReply { aoMuteReply(ev); break }
+            if ev.pointee.reply_userdata == PlayerSession.aoVolumeReply { aoVolumeReplyHandler(ev); break }
             audioInfoReply(ev)
         case MPV_EVENT_END_FILE:
             guard let d = ev.pointee.data else { return }
@@ -246,6 +271,40 @@ final class PlayerSession: NSObject {
         }
     }
     private var logCount = 0
+
+    // MARK: audio output mute availability (asynchronous query; `ao-mute` raises no change event when an output opens, so it is asked for whenever the audio output is reconfigured)
+    private static let aoMuteReply: UInt64 = 0x7470_6190
+    private func queryAOMute() {
+        guard let h = mpv, !ending else { return }
+        _ = mpv_get_property_async(h, PlayerSession.aoMuteReply, "ao-mute", MPV_FORMAT_FLAG)
+    }
+    private func aoMuteReply(_ ev: UnsafeMutablePointer<mpv_event>) {
+#if TP_TESTING
+        LatencyProbe.state()
+#endif
+        if ev.pointee.error >= 0, let d = ev.pointee.data, let v = d.assumingMemoryBound(to: mpv_event_property.self).pointee.data {
+            aoMuteAvailable = true; aoMuted = v.assumingMemoryBound(to: Int32.self).pointee != 0
+        } else { aoMuteAvailable = false; aoMuted = false }
+        controlsView.setMuted(isMuted)
+#if TP_TESTING
+        LatencyProbe.ui({ [telemetry] k, f in telemetry.emit(k, f) }, value: isMuted, icon: controlsView.volumeAccessibilityLabel, source: "ao-mute-reply")
+#endif
+    }
+
+    // MARK: audio output volume (same story as the mute: mpv's `volume` is a software gain applied before the output's ~2 s queue, so a change is heard late; `ao-volume` is the output's own)
+    private static let aoVolumeReply: UInt64 = 0x7470_6191
+    private func queryAOVolume() {
+        guard let h = mpv, !ending else { return }
+        _ = mpv_get_property_async(h, PlayerSession.aoVolumeReply, "ao-volume", MPV_FORMAT_DOUBLE)
+    }
+    private func aoVolumeReplyHandler(_ ev: UnsafeMutablePointer<mpv_event>) {
+        if ev.pointee.error >= 0, let d = ev.pointee.data, let v = d.assumingMemoryBound(to: mpv_event_property.self).pointee.data {
+            aoVolumeAvailable = true; aoVolume = v.assumingMemoryBound(to: Double.self).pointee
+        } else { aoVolumeAvailable = false }
+#if TP_TESTING
+        LatencyProbe.volumeState(emit: { [telemetry] k, f in telemetry.emit(k, f) }, ao: aoVolume, soft: softVolume)
+#endif
+    }
 
     // MARK: audio diagnostics (read-only: asynchronous property queries; nothing is set, nothing blocks)
     private static let audioReplyBase: UInt64 = 0x7470_6101
@@ -351,9 +410,46 @@ final class PlayerSession: NSObject {
         guard !coverageCache.isEmpty else { return -1 }
         return Int(coverageCache[max(0, min(coverageCache.count - 1, Int(f * Double(coverageCache.count))))])
     }
-    func adjustVolume(_ d: Int) { cmd(["add", "volume", String(d)]) }
-    func toggleMute() { cmd(["cycle", "mute"]) }
+    /// Up / Down keys: steps of 5 over 0...130 as before. With an output volume (`ao-volume`, 0...100) the steps below 100 % go to the OUTPUT (heard at once); above 100 % (boost) the software gain
+    /// is used, and without an output volume (null output, no audio) everything stays on the software gain. mpv does the arithmetic (`add` clamps); the app keeps no volume of its own.
+    func adjustVolume(_ d: Int) {
+#if TP_TESTING
+        LatencyProbe.volumeAction(input: NSApp.currentEvent?.timestamp)
+#endif
+        let viaOutput = aoVolumeAvailable && (d > 0 ? aoVolume < 99.5 : softVolume <= 100.5)
+        cmd(["add", viaOutput ? "ao-volume" : "volume", String(d)])
+        // The two copies below only ROUTE the next key press (at the 100 % boundary) before mpv's answer has been read; mpv's own value overwrites them (the `volume` event, the
+        // `ao-volume` query below), so they cannot drift from mpv's state.
+        if viaOutput { aoVolume = min(100, max(0, aoVolume + Double(d))) } else { softVolume = min(130, max(0, softVolume + Double(d))) }
+        if aoVolumeAvailable { queryAOVolume() }            // `ao-volume` raises no change event: ask for the new value
+#if TP_TESTING
+        LatencyProbe.volumePath(viaOutput ? "ao-volume" : "volume")
+#endif
+    }
+    /// Mute (toolbar button, M key, Playback menu: one path). The audio output's own mute (`ao-mute`) is immediate; mpv's software `mute` only affects audio that is not yet queued in the
+    /// output (the avfoundation output queues about 2 s), which made muting feel very late. `cycle` keeps mpv the arbiter, so rapid toggles stay consistent whatever the app has seen yet.
+    /// If the software mute is on (for example started with --mute) it is cycled off first; without a usable output mute the software mute is used.
+    func toggleMute() {
+#if TP_TESTING
+        LatencyProbe.action(input: NSApp.currentEvent?.timestamp)
+#endif
+        let viaOutput = aoMuteAvailable && !muted
+        cmd(["cycle", viaOutput ? "ao-mute" : "mute"])
+        if viaOutput { queryAOMute() }                      // mpv raises no change event for `ao-mute`: ask for the new value (answered after the cycle, in order), so the icon shows mpv's state
+#if TP_TESTING
+        LatencyProbe.dispatched()
+#endif
+    }
+#if TP_TESTING
+    /// Testing only: the CURRENT mute property read synchronously from mpv (not the observed copy).
+    func mpvMuteNow() -> String { guard let h = mpv, let c = mpv_get_property_string(h, "mute") else { return "?" }; defer { mpv_free(c) }; return String(cString: c) }
+    func mpvPropNow(_ n: String) -> String { guard let h = mpv, let c = mpv_get_property_string(h, n) else { return "n/a" }; defer { mpv_free(c) }; return String(cString: c) }
+    func mpvAOMuteNow() -> String { guard let h = mpv, let c = mpv_get_property_string(h, "ao-mute") else { return "n/a" }; defer { mpv_free(c) }; return String(cString: c) }
+#endif
     func toggleFullScreen() { mpvWindow?.toggleFullScreen(nil) }
+    /// Playback menu (keyboard / VoiceOver access to the toolbar actions): compact <-> expanded controls.
+    func toggleControlsSize() { controls.toggleExpanded() }
+    var canToggleControlsSize: Bool { controls.layout?.canExpand == true }
 
     /// User cancelled a start that has not produced playback: tear the session down (same safe order as any end) and return to the file list.
     func cancel() {
@@ -432,7 +528,7 @@ final class PlayerSession: NSObject {
         if !controlsView.seekBar.dragging {
             let held = mpvError == nil ? seekTracker.heldTarget(now: telemetry.now, mpvSeeking: seeking) : nil
             let shown = SeekDisplay.seconds(actual: timePos, held: held)
-            controlsView.timeLabel.stringValue = ControlsView.format(shown); controlsView.seekBar.valueText = controlsView.timeLabel.stringValue
+            controlsView.timeLabel.stringValue = ControlsView.format(shown); controlsView.seekBar.valueText = "\(controlsView.timeLabel.stringValue) of \(ControlsView.format(duration))"
             if duration > 0 { controlsView.seekBar.fraction = SeekDisplay.fraction(seconds: shown, duration: duration) }
         }
         controlsView.setPlaying(!paused)
@@ -590,7 +686,11 @@ final class PlayerSession: NSObject {
             }
             switch e.charactersIgnoringModifiers?.lowercased() {
             case "f": self.toggleFullScreen(); return nil
-            case "m": self.toggleMute(); return nil
+            case "m":
+#if TP_TESTING
+                LatencyProbe.trigger = "key"
+#endif
+                self.toggleMute(); return nil
             case "e": self.controls.toggleExpanded(); return nil
             case "r": if self.mpvError != nil { self.retry(); return nil }
             default: break
