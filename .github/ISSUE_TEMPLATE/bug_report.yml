@@ -1,0 +1,78 @@
+name: Bug report
+description: Something in TorrentPlayer does not work as expected
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Please search existing issues first.
+        **Do not post private data.** Remove tokens, personal file paths, usernames, IP addresses and other identifying network information from anything you paste.
+  - type: input
+    id: version
+    attributes:
+      label: TorrentPlayer version
+      description: The release you installed, for example 0.2.0.
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "macOS 27.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Mac architecture
+      description: TorrentPlayer supports Apple silicon only.
+      options:
+        - Apple silicon (arm64)
+        - Intel (not supported, please say so if you tried)
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: What does the problem affect?
+      options:
+        - Local video file
+        - Torrent file (.torrent)
+        - Magnet link
+        - More than one of these
+        - The app in general (launch, windows, menus)
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open ...
+        2. Click ...
+        3. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (optional)
+      description: |
+        Only if you are comfortable sharing. The app keeps a local log (File ▸ Reveal Telemetry Log in Finder) that can contain torrent and file names.
+        **Before pasting, remove private data: tokens, personal paths, usernames, IP addresses and anything identifying.** Paste only the relevant last lines.
+      render: text
