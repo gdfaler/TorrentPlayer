@@ -80,7 +80,42 @@ final class HomeCard: NSView {
     }
 }
 
-final class HomeView: NSView, NSTextFieldDelegate {
+/// The Recent list: Return / Space open the selected row, Delete removes it.
+final class RecentsTableView: NSTableView {
+    var onOpen: ((Int) -> Void)?
+    var onRemove: ((Int) -> Void)?
+    override func keyDown(with e: NSEvent) {
+        switch e.keyCode {
+        case 36, 76, 49: if selectedRow >= 0 { onOpen?(selectedRow) } else { super.keyDown(with: e) }
+        case 51, 117: if selectedRow >= 0 { onRemove?(selectedRow) } else { super.keyDown(with: e) }
+        default: super.keyDown(with: e)
+        }
+    }
+}
+
+/// One row of the Recent list: file name, folder (or the problem), and a remove button.
+final class RecentCell: NSTableCellView {
+    let nameField = NSTextField(labelWithString: ""), subField = NSTextField(labelWithString: "")
+    let removeButton = NSButton()
+    var onRemove: (() -> Void)?
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        nameField.font = .systemFont(ofSize: 13, weight: .medium); nameField.lineBreakMode = .byTruncatingMiddle
+        subField.font = .systemFont(ofSize: 11); subField.lineBreakMode = .byTruncatingHead
+        removeButton.isBordered = false; removeButton.imagePosition = .imageOnly; removeButton.target = self; removeButton.action = #selector(remove)
+        removeButton.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: nil)
+        removeButton.toolTip = "Remove from Recents"
+        let text = NSStackView(views: [nameField, subField]); text.orientation = .vertical; text.alignment = .leading; text.spacing = 1
+        [text, removeButton].forEach { $0.translatesAutoresizingMaskIntoConstraints = false; addSubview($0) }
+        NSLayoutConstraint.activate([
+            text.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10), text.centerYAnchor.constraint(equalTo: centerYAnchor), text.trailingAnchor.constraint(lessThanOrEqualTo: removeButton.leadingAnchor, constant: -8),
+            removeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8), removeButton.centerYAnchor.constraint(equalTo: centerYAnchor), removeButton.widthAnchor.constraint(equalToConstant: 22), removeButton.heightAnchor.constraint(equalToConstant: 22)])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    @objc private func remove() { onRemove?() }
+}
+
+final class HomeView: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
     // callbacks into the controller (every open path ends in AppController.open(requests:) / openMagnet)
     var onDrop: ((HomeDrop) -> Void)?
     var onChooseFile: (() -> Void)?
@@ -89,6 +124,9 @@ final class HomeView: NSView, NSTextFieldDelegate {
     var onOpenLink: ((String) -> Void)?
     var onAction: ((HomeAction) -> Void)?
     var onAppearance: ((HomeAppearance) -> Void)?
+    var onOpenRecent: ((String) -> Void)?
+    var onRemoveRecent: ((String) -> Void)?
+    var onClearRecents: (() -> Void)?
 
     let table = NSTableView()
     let scroll = NSScrollView()
@@ -111,6 +149,14 @@ final class HomeView: NSView, NSTextFieldDelegate {
     private let appearanceControl = NSSegmentedControl(labels: HomeAppearance.allCases.map { $0.title }, trackingMode: .selectOne, target: nil, action: nil)
     private let entryRow = NSStackView(), magnetRow = NSStackView()
     private var observers: [NSObjectProtocol] = []
+    private let recentsTable = RecentsTableView()
+    private let recentsScroll = NSScrollView()
+    private let recentsHeader = NSStackView()
+    private var recentsHeight: NSLayoutConstraint!
+    private let recentsLabel = NSTextField(labelWithString: "Recent")
+    private let clearRecentsButton = NSButton()
+    private(set) var recentRows: [RecentRowModel] = []
+    private var recentsShown: Bool { presentation.mode == .empty && !recentRows.isEmpty }
     private var listFill: [NSLayoutConstraint] = []                      // active only while the file list is shown: the list takes the card's height
 
     override init(frame: NSRect) {
@@ -157,12 +203,29 @@ final class HomeView: NSView, NSTextFieldDelegate {
         scroll.translatesAutoresizingMaskIntoConstraints = false; scroll.wantsLayer = true; scroll.layer?.cornerRadius = 10
         scroll.setAccessibilityLabel("Files in this torrent")
 
+        // Recent files (idle state only, below the drop hint; secondary to the Open actions)
+        recentsLabel.font = .systemFont(ofSize: 11, weight: .semibold); recentsLabel.setAccessibilityElement(false)
+        clearRecentsButton.title = "Clear All"; clearRecentsButton.isBordered = false; clearRecentsButton.font = .systemFont(ofSize: 11, weight: .medium)
+        clearRecentsButton.target = self; clearRecentsButton.action = #selector(clearRecents); clearRecentsButton.setAccessibilityLabel("Clear all recent files")
+        let spacer = NSView(); spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        recentsHeader.setViews([recentsLabel, spacer, clearRecentsButton], in: .leading); recentsHeader.orientation = .horizontal; recentsHeader.alignment = .centerY
+        recentsHeader.translatesAutoresizingMaskIntoConstraints = false
+        let rcol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("recent")); rcol.resizingMask = .autoresizingMask
+        recentsTable.addTableColumn(rcol); recentsTable.headerView = nil; recentsTable.style = .plain; recentsTable.rowHeight = 40; recentsTable.backgroundColor = .clear
+        recentsTable.selectionHighlightStyle = .regular; recentsTable.allowsEmptySelection = true; recentsTable.intercellSpacing = NSSize(width: 0, height: 2)
+        recentsTable.dataSource = self; recentsTable.delegate = self; recentsTable.target = self; recentsTable.action = #selector(recentClicked)
+        recentsTable.onOpen = { [weak self] r in self?.openRecent(row: r) }; recentsTable.onRemove = { [weak self] r in self?.removeRecent(row: r) }
+        recentsTable.setAccessibilityLabel("Recent files")
+        recentsScroll.documentView = recentsTable; recentsScroll.hasVerticalScroller = true; recentsScroll.drawsBackground = false; recentsScroll.borderType = .noBorder
+        recentsScroll.translatesAutoresizingMaskIntoConstraints = false; recentsScroll.wantsLayer = true; recentsScroll.layer?.cornerRadius = 10
+        recentsHeight = recentsScroll.heightAnchor.constraint(equalToConstant: 40); recentsHeight.isActive = true       // fits the rows (3 visible, then it scrolls)
+
         actionRow.orientation = .horizontal; actionRow.spacing = 10; actionRow.alignment = .centerY; actionRow.setHuggingPriority(.required, for: .horizontal)
 
-        let content = NSStackView(views: [icon, spinner, titleLabel, detailLabel, hintLabel, scroll, actionRow])
+        let content = NSStackView(views: [icon, spinner, titleLabel, detailLabel, hintLabel, recentsHeader, recentsScroll, scroll, actionRow])
         content.orientation = .vertical; content.alignment = .centerX; content.spacing = 10; content.distribution = .fill
         scroll.setContentHuggingPriority(.init(1), for: .vertical)
-        content.setCustomSpacing(14, after: icon); content.setCustomSpacing(16, after: hintLabel); content.setCustomSpacing(16, after: detailLabel)
+        content.setCustomSpacing(14, after: icon); content.setCustomSpacing(18, after: hintLabel); content.setCustomSpacing(4, after: recentsHeader); content.setCustomSpacing(16, after: detailLabel)
         content.translatesAutoresizingMaskIntoConstraints = false
         card.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(content)
@@ -208,6 +271,7 @@ final class HomeView: NSView, NSTextFieldDelegate {
             content.topAnchor.constraint(greaterThanOrEqualTo: card.topAnchor, constant: 22), content.bottomAnchor.constraint(lessThanOrEqualTo: card.bottomAnchor, constant: -22),
             titleLabel.widthAnchor.constraint(lessThanOrEqualTo: card.widthAnchor, constant: -56), detailLabel.widthAnchor.constraint(lessThanOrEqualTo: card.widthAnchor, constant: -56),
             scroll.widthAnchor.constraint(equalTo: card.widthAnchor, constant: -40), scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
+            recentsScroll.widthAnchor.constraint(equalTo: card.widthAnchor, constant: -40), recentsHeader.widthAnchor.constraint(equalTo: recentsScroll.widthAnchor, constant: -20),
             appearanceControl.centerXAnchor.constraint(equalTo: centerXAnchor), appearanceControl.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -16)]
         NSLayoutConstraint.activate(cs)
         listFill = [content.topAnchor.constraint(equalTo: card.topAnchor, constant: 22), content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -22),
@@ -222,8 +286,10 @@ final class HomeView: NSView, NSTextFieldDelegate {
         detailLabel.isHidden = p.detail.isEmpty
         hintLabel.isHidden = p.mode != .empty
         icon.image = NSImage(systemSymbolName: p.symbol, accessibilityDescription: nil)
-        icon.isHidden = p.mode == .progress || p.mode == .list
+        icon.isHidden = p.mode == .progress || p.mode == .list || recentsShown                  // the list of recents takes the icon's place
+        if recentsShown { detailLabel.isHidden = true }                                         // the explanation returns when there is nothing recent to show
         scroll.isHidden = p.mode != .list
+        recentsHeader.isHidden = !recentsShown; recentsScroll.isHidden = !recentsShown
         if p.mode == .list { NSLayoutConstraint.activate(listFill) } else { NSLayoutConstraint.deactivate(listFill) }
         if p.spinner { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
         spinner.isHidden = !p.spinner
@@ -234,6 +300,35 @@ final class HomeView: NSView, NSTextFieldDelegate {
         if changedMode, p.mode == .error {
             NSAccessibility.post(element: NSApp as Any, notification: .announcementRequested, userInfo: [.announcement: p.title + ". " + p.detail, .priority: NSAccessibilityPriorityLevel.high.rawValue])
         }
+    }
+
+    // MARK: recent files
+    func setRecents(_ rows: [RecentRowModel]) {
+        let changed = rows != recentRows
+        recentRows = rows
+        recentsHeight.constant = rows.count <= 3 ? CGFloat(max(rows.count, 1)) * 40 : 140         // 3 rows, or 3.5 when more exist so the scrolling is visible
+        if changed { recentsTable.reloadData() }
+        apply(presentation)                                                                     // shows or hides the section for the current state
+        restyleText()
+    }
+    private func openRecent(row: Int) { if row >= 0, row < recentRows.count { onOpenRecent?(recentRows[row].id) } }
+    private func removeRecent(row: Int) { if row >= 0, row < recentRows.count { onRemoveRecent?(recentRows[row].id) } }
+    @objc private func recentClicked() { openRecent(row: recentsTable.clickedRow) }            // the remove button handles its own clicks
+    @objc private func clearRecents() { onClearRecents?() }
+    func numberOfRows(in tableView: NSTableView) -> Int { tableView === recentsTable ? recentRows.count : 0 }
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard tableView === recentsTable, row < recentRows.count else { return nil }
+        let m = recentRows[row]
+        let id = NSUserInterfaceItemIdentifier("recentCell")
+        let cell = (tableView.makeView(withIdentifier: id, owner: self) as? RecentCell) ?? { let c = RecentCell(frame: .zero); c.identifier = id; return c }()
+        cell.nameField.stringValue = m.title; cell.subField.stringValue = m.subtitle
+        cell.nameField.textColor = m.available ? palette.text.ns : palette.secondaryText.ns
+        cell.subField.textColor = m.available ? palette.secondaryText.ns : palette.danger.ns
+        cell.removeButton.contentTintColor = palette.secondaryText.ns
+        cell.removeButton.setAccessibilityLabel("Remove \(m.title) from Recents")
+        let rowID = m.id; cell.onRemove = { [weak self] in self?.onRemoveRecent?(rowID) }
+        cell.setAccessibilityElement(true); cell.setAccessibilityRole(.row); cell.setAccessibilityLabel(m.accessibilityLabel)
+        return cell
     }
 
     private func rebuildActions(_ actions: [HomeAction]) {
@@ -278,9 +373,12 @@ final class HomeView: NSView, NSTextFieldDelegate {
         rebuildActions(presentation.actions)
         for b in [openFileButton, openTorrentButton] { b.bezelColor = nil }
         openFileButton.bezelColor = palette.accent.ns
+        recentsTable.reloadData()
     }
     private func restyleText() {
         wordmark.textColor = palette.secondaryText.ns
+        recentsLabel.textColor = palette.secondaryText.ns
+        clearRecentsButton.attributedTitle = NSAttributedString(string: "Clear All", attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: palette.secondaryText.ns])
         titleLabel.textColor = presentation.mode == .error ? palette.danger.ns : palette.text.ns
         detailLabel.textColor = palette.secondaryText.ns; hintLabel.textColor = palette.secondaryText.ns
         icon.contentTintColor = presentation.mode == .error ? palette.danger.ns : palette.secondaryText.ns
@@ -312,6 +410,10 @@ final class HomeView: NSView, NSTextFieldDelegate {
     }
     var isDragHighlighted: Bool { card.dragging }
 #if TP_TESTING
+    var recentsVisible: Bool { !recentsScroll.isHidden }
+    func testClickRecent(_ i: Int) { openRecent(row: i) }
+    func testRemoveRecent(_ i: Int) { removeRecent(row: i) }
+    func testPressClearAll() { clearRecentsButton.performClick(nil) }
     func testButton(_ name: String) -> NSButton? { ["file": openFileButton, "torrent": openTorrentButton, "paste": pasteButton, "link": openLinkButton][name] ?? actionButtons.first(where: { "\($0.key)".lowercased() == name })?.value }
     var layoutFrames: [String: String] { ["card": NSStringFromRect(card.frame), "entry": NSStringFromRect(entryRow.frame), "magnet": NSStringFromRect(magnetRow.frame), "appearance": NSStringFromRect(appearanceControl.frame), "wordmark": NSStringFromRect(wordmark.frame), "self": NSStringFromRect(bounds)] }
 #endif

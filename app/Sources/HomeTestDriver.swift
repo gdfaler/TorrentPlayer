@@ -2,7 +2,7 @@
 // requests that fail offline, drops through a private pasteboard, appearance switching, captures of the home window and a timeline of the fade.
 // Script: "seconds:command=arg;..." (seconds after launch). Log: TP_HOME_LOG (JSON lines). Captures: TP_HOME_DIR.
 // Commands: show=idle|fetching|nopeers|choosing|choosingnovideo|errorfile|errortorrent|errormagnet | open=<path> | magnet=<text> | appearance=system|light|dark | size=WxH
-//           drop=<path>|dropmagnet=<link>|dropjunk | dragon|dragoff | action=<cancel|play|tryagain|editlink|openfile|startover> | sample=<ms> | end (ends the playback session) | capture=<name> | state | quit
+//           seedrecent=<path> | recents | openrecent=<i> | removerecent=<i> | clearall (presses Clear All: shows the confirmation) | alert | alertclick=<0 Clear|1 Cancel> | drop=<path>|dropmagnet=<link>|dropjunk | dragon|dragoff | action=<cancel|play|tryagain|editlink|openfile|startover> | sample=<ms> | end (ends the playback session) | closered | cmdw | performclose | winfo | capture=<name> | state | quit
 import AppKit
 
 #if TP_TESTING
@@ -96,6 +96,27 @@ final class HomeTestDriver {
         case "sheet":                                                   // the open panel sheet, if any: its message and allowed types
             if let p = c.window.attachedSheet as? NSOpenPanel { log("sheet", ["message": p.message ?? "", "types": p.allowedContentTypes.map { $0.identifier }.sorted(), "multiple": p.allowsMultipleSelection, "dirs": p.canChooseDirectories]) } else { log("sheet", ["none": true]) }
         case "closesheet": if let s = c.window.attachedSheet { c.window.endSheet(s, returnCode: .cancel); s.orderOut(nil) }; log("closesheet", [:])
+        case "recents":                                                 // the Recent section as the user sees it
+            log("recents", ["visible": c.home.recentsVisible, "count": c.recents.entries.count, "rows": c.home.recentRows.map { ["title": $0.title, "subtitle": $0.subtitle, "available": $0.available] }])
+        case "seedrecent": log("seedrecent", ["recorded": c.recents.record(path: arg)]); c.refreshRecents()          // test seed (a real run records only after playback started)
+        case "openrecent": if let i = Int(arg) { c.home.testClickRecent(i) }; log("openrecent", ["index": arg])
+        case "removerecent": if let i = Int(arg) { c.home.testRemoveRecent(i) }; log("removerecent", ["index": arg, "count": c.recents.entries.count])
+        case "clearall": c.home.testPressClearAll(); log("clearall", ["count": c.recents.entries.count])
+        case "alert":
+            if let a = c.window.attachedSheet, let t = a.value(forKey: "title") as? String { _ = t }
+            let buttons = c.window.attachedSheet?.contentView.map { Self.buttons(in: $0).map { $0.title } } ?? []
+            log("alert", ["sheet": c.window.attachedSheet != nil, "buttons": buttons, "count": c.recents.entries.count])
+        case "alertclick":                                              // 0 = default (Clear All), 1 = Cancel
+            if let sheet = c.window.attachedSheet, let cv = sheet.contentView { let bs = Self.buttons(in: cv).sorted { $0.frame.minX > $1.frame.minX }; if let i = Int(arg), i < bs.count { bs[i].performClick(nil) } }
+            log("alertclick", ["arg": arg])
+        case "closered", "cmdw", "performclose":                        // close the PLAYBACK window the way a user does: red button click, Cmd-W through the main menu, or performClose
+            guard let w = NSApp.windows.first(where: { $0.title == "TorrentPlayer" && $0.isVisible && $0.contentView != nil }) else { log(cmd, ["error": "no playback window"]); return }
+            log(cmd, ["fullscreen": w.styleMask.contains(.fullScreen), "windows": NSApp.windows.filter { $0.isVisible }.count])
+            if cmd == "closered" { w.standardWindowButton(.closeButton)?.performClick(nil) }
+            else if cmd == "performclose" { w.performClose(nil) }
+            else if let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: w.windowNumber, context: nil, characters: "w", charactersIgnoringModifiers: "w", isARepeat: false, keyCode: 13) { NSApp.sendEvent(e) }
+        case "winfo":                                                   // visible windows and whether a session exists (duplicates / stale windows)
+            log("winfo", ["visible": NSApp.windows.filter { $0.isVisible }.map { "\($0.title)|\(type(of: $0))" }.sorted(), "session": c.session != nil, "phase": "\(c.phase)", "homeVisible": c.window.isVisible, "homeAlpha": c.window.alphaValue, "key": NSApp.keyWindow?.title ?? "-", "recents": c.recents.entries.count])
         case "capture": capture(arg)
         case "state": log("state", state())
         case "quit": c.telemetry.close(); NSApp.terminate(nil)
@@ -103,6 +124,7 @@ final class HomeTestDriver {
         }
     }
 
+    private static func buttons(in v: NSView) -> [NSButton] { v.subviews.flatMap { ($0 as? NSButton).map { [$0] } ?? [] + buttons(in: $0) } }
     private typealias CapFn = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
     private func capture(_ name: String) {                                  // window-server composite of OUR window (CGWindowListCreateImage by window id); evidence, not approval
         guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGWindowListCreateImage") else { return }

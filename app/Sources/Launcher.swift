@@ -47,8 +47,10 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     var failureTitle = "Could not open this torrent"
     var failureKind = HomeFailureKind.torrent
     var failureRetryable = true
+    var failureDetailHasFileName = false                           // the shown message names a recent file: it stays out of telemetry
     private var fadeGeneration = 0
     var switcher = SwitchCoordinator()
+    let recents = RecentsStore(defaults: AppDefaults.shared)       // recently played LOCAL videos (never torrents or magnet links); isolated suite in automated tests
 
     // UI
     let window: NSWindow
@@ -90,9 +92,14 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         home.onPasteMagnet = { [weak self] in self?.pasteMagnet() }
         home.onOpenLink = { [weak self] link in self?.openMagnet(link) }
         home.onAction = { [weak self] a in self?.perform(a) }
+        home.onOpenRecent = { [weak self] id in self?.openRecent(id: id) }
+        home.onRemoveRecent = { [weak self] id in self?.removeRecent(id: id) }
+        home.onClearRecents = { [weak self] in self?.confirmClearRecents() }
+        NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in self?.refreshRecents() }      // files may have been moved while the app was in the background
         home.table.dataSource = self; home.table.delegate = self; home.table.doubleAction = #selector(playSelected); home.table.target = self
         window.center()
         refreshUI()
+        refreshRecents()
     }
 
     /// The launcher phase as the presentation sees it.
@@ -108,9 +115,53 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
 
     func refreshUI() {
         let p = HomePresentation.make(homeState)
-        if p.title != lastLauncherTitle { lastLauncherTitle = p.title; telemetry.emit("ui_launcher", ["title": p.title, "detail": p.detail]) }
+        if p.title != lastLauncherTitle { lastLauncherTitle = p.title; telemetry.emit("ui_launcher", ["title": p.title, "detail": (p.mode == .error && failureDetailHasFileName) ? "" : p.detail]) }
         home.apply(p)
         if p.mode == .list { home.setPlayEnabled(table.selectedRow >= 0) }
+    }
+
+    // MARK: recent files
+    func refreshRecents() {
+        home.setRecents(recents.entries.map { RecentRowModel.make(entry: $0, availability: recents.availability(of: $0)) })
+    }
+
+    /// Opens a recent through the normal route (OpenClassifier -> SwitchCoordinator). Only the very file the entry stands for is opened; if it cannot be found the user is told and nothing else is opened.
+    func openRecent(id: String) {
+        guard let e = recents.entry(id: id) else { refreshRecents(); return }
+        switch recents.availability(of: e) {
+        case .available(let path):
+            telemetry.emit("recent_open", [:])                                           // no file name or path in telemetry
+            open(requests: [path])
+        case .missing, .inaccessible:
+            let why = recents.availability(of: e)
+            telemetry.emit("recent_unavailable", ["reason": why == .inaccessible ? "inaccessible" : "missing"])
+            openedSource = ""; setFailure(.file, title: "Could not open this file", retryable: false); failureDetailHasFileName = true
+            showHome()
+            phase = .failed(why == .inaccessible ? "“\(e.name)” cannot be read (permission denied). Check its permissions, or remove it from Recents."
+                                                 : "“\(e.name)” is no longer at its last location. It may have been moved to another disk, renamed or deleted. Open it again with Open File…, or remove it from Recents.")
+            refreshRecents()
+        }
+    }
+    func removeRecent(id: String) {
+        let name = recents.entry(id: id)?.name
+        recents.remove(id: id); refreshRecents()
+        if let n = name { NSAccessibility.post(element: NSApp as Any, notification: .announcementRequested, userInfo: [.announcement: "Removed \(n) from Recents"]) }
+    }
+    /// Clear All asks first: it removes the list only, never the files.
+    func confirmClearRecents() {
+        guard !recents.entries.isEmpty else { return }
+        let a = NSAlert()
+        a.messageText = "Clear all recent files?"
+        a.informativeText = "This removes the list only. Your video files are not deleted."
+        a.alertStyle = .warning
+        let clear = a.addButton(withTitle: "Clear All"); clear.hasDestructiveAction = true
+        a.addButton(withTitle: "Cancel")
+        showHome()
+        a.beginSheetModal(for: window) { [weak self] r in
+            guard r == .alertFirstButtonReturn, let self = self else { return }
+            self.telemetry.emit("recents_cleared", ["count": self.recents.entries.count])
+            self.recents.clear(); self.refreshRecents()
+        }
     }
 
     func perform(_ a: HomeAction) {
@@ -161,13 +212,14 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     func showHome() {
         fadeGeneration += 1                                                             // cancels a fade-out still running
         window.level = .normal; window.ignoresMouseEvents = false
+        refreshRecents()
         let d = HomeMotion.duration(HomeMotion.fadeIn, reduceMotion: home.environment.reduceMotion)
         if !window.isVisible { window.alphaValue = d > 0 ? 0 : 1 }
         window.makeKeyAndOrderFront(nil)
         if window.alphaValue < 1 { NSAnimationContext.runAnimationGroup { c in c.duration = d; c.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut); self.window.animator().alphaValue = 1 } }
     }
 
-    private func setFailure(_ kind: HomeFailureKind, title: String, retryable: Bool) { failureKind = kind; failureTitle = title; failureRetryable = retryable }
+    private func setFailure(_ kind: HomeFailureKind, title: String, retryable: Bool) { failureKind = kind; failureTitle = title; failureRetryable = retryable; failureDetailHasFileName = false }
 
     func open(source: String) { open(requests: [source]) }
 
@@ -274,6 +326,12 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         hideHome()
         s.start()
         if options.autotestMode { armAutotest() }
+    }
+
+    /// The first frame of a LOCAL video was decoded: only now does it count as successfully opened.
+    func playerSessionDidStartPlayback(_ s: PlayerSession) {
+        guard s.isLocal, let path = s.localPath, recents.record(path: path) else { return }
+        refreshRecents()
     }
 
     func playerSessionDidEnd(_ s: PlayerSession, reason: String) {

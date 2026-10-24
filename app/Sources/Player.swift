@@ -15,6 +15,7 @@ struct PlayerSettings {
 
 protocol PlayerSessionDelegate: AnyObject {
     func playerSessionDidEnd(_ s: PlayerSession, reason: String)
+    func playerSessionDidStartPlayback(_ s: PlayerSession)         // first frame decoded: a local video counts as "successfully opened" only now
 }
 
 final class PlayerSession: NSObject {
@@ -196,6 +197,7 @@ final class PlayerSession: NSObject {
             let id = ev.pointee.event_id
             if id == MPV_EVENT_NONE { break }
             handle(ev, id)
+            if ending || mpv != h { break }              // handling the event may have ended the session (SHUTDOWN, close): its handle is being destroyed on another thread and must not be polled again
         }
     }
 
@@ -240,6 +242,7 @@ final class PlayerSession: NSObject {
         case MPV_EVENT_PLAYBACK_RESTART:
             if !playbackStarted {
                 playbackStarted = true
+                delegate?.playerSessionDidStartPlayback(self)
                 telemetry.emit("playback_started", ["since_open_s": since(), "note": "first PLAYBACK_RESTART (decoder running); approximates first frame"])
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in self?.reportGeometry() }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in self?.requestAudioInfo() }   // diagnostics only: read-only property queries

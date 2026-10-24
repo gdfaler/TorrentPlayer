@@ -2,6 +2,16 @@
 // Increase Contrast, the persisted appearance preference and the transition timing. No AppKit: unit-tested on its own (tests/app/home_model_test.swift).
 import Foundation
 
+/// The preferences the app reads and writes. Testing builds can point it at an isolated suite (TP_DEFAULTS_SUITE) so automated runs never touch the user's real settings or recents.
+enum AppDefaults {
+    static let shared: UserDefaults = {
+#if TP_TESTING
+        if let s = ProcessInfo.processInfo.environment["TP_DEFAULTS_SUITE"], !s.isEmpty, let d = UserDefaults(suiteName: s) { return d }
+#endif
+        return .standard
+    }()
+}
+
 // MARK: appearance preference
 enum HomeAppearance: String, CaseIterable {
     case system, light, dark
@@ -9,8 +19,8 @@ enum HomeAppearance: String, CaseIterable {
     var title: String { switch self { case .system: return "System"; case .light: return "Light"; case .dark: return "Dark" } }
 
     /// Reads the stored choice; anything missing or unknown means System (the default).
-    static func load(_ d: UserDefaults = .standard) -> HomeAppearance { d.string(forKey: defaultsKey).flatMap(HomeAppearance.init(rawValue:)) ?? .system }
-    func save(_ d: UserDefaults = .standard) { d.set(rawValue, forKey: Self.defaultsKey) }
+    static func load(_ d: UserDefaults = AppDefaults.shared) -> HomeAppearance { d.string(forKey: defaultsKey).flatMap(HomeAppearance.init(rawValue:)) ?? .system }
+    func save(_ d: UserDefaults = AppDefaults.shared) { d.set(rawValue, forKey: Self.defaultsKey) }
     /// Whether the dark palette applies, given what the system currently uses.
     func isDark(systemIsDark: Bool) -> Bool { switch self { case .system: return systemIsDark; case .light: return false; case .dark: return true } }
 }
