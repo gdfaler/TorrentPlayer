@@ -1,0 +1,64 @@
+name: CI
+
+# Pull request validation for main. Runs on pull_request (never pull_request_target) so that code from a pull request
+# never runs with repository secrets or a write token. See tools/scripts/ci_*.{py,sh} to reproduce each job locally.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repo-checks:
+    name: Repository checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Repository hygiene, packaging consistency and workflow security
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            python3 tools/scripts/ci_repo_checks.py --commit-range "$BASE_SHA..$HEAD_SHA"
+          else
+            python3 tools/scripts/ci_repo_checks.py
+          fi
+
+  core-unit-tests:
+    name: C++ core unit tests (macOS arm64)
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: brew install cmake ninja pkg-config boost libtorrent-rasterbar openssl@3
+      - name: Build and run the unit tests
+        run: tools/scripts/ci_core_unit_tests.sh ci_build
+
+  swift-unit-tests:
+    name: Swift unit tests (macOS arm64)
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and run the app-independent Swift test suites
+        run: tools/scripts/ci_swift_tests.sh
