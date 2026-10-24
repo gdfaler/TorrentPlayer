@@ -56,6 +56,9 @@ struct StreamStatus {
   std::string web_seed_last_error;
 };
 
+// "ip:port" a web-seed URL resolves to -> the URL(s) using it (written once by a detached resolver thread, read by the scheduler)
+struct WebEpMap { std::mutex mu; std::map<std::string, std::vector<std::string>> m; };
+
 class StreamSession {
  public:
   ~StreamSession();
@@ -158,6 +161,13 @@ class StreamSession {
   WaitInfo wait_cache_;                                     // scheduler thread only
   ProgressWatch watch_;                                     // scheduler thread only
   bool idle_logged_ = false;
+  // ---- web-seed stall remedy: requests of the piece the reader waits for must not stay parked on a web seed that delivers nothing (see release_stalled_web_seeds)
+  struct WebSeedStall { std::chrono::steady_clock::time_point until, last_release; int strikes = 0; bool off = false; };
+  std::map<std::string, WebSeedStall> web_stall_;           // url -> penalty state; scheduler thread only
+  std::shared_ptr<WebEpMap> web_ep_;                        // filled once by a detached resolver thread that owns only a copy of the URLs and this shared state (never blocks shutdown)
+  bool web_enabled_ = false;                                // the policy currently has the web seeds added; scheduler thread only
+  void release_stalled_web_seeds(double t);
+  bool web_seed_off(const std::string& url) const { auto it = web_stall_.find(url); return it != web_stall_.end() && it->second.off; }
   std::map<int, int> deadlines_applied_;                    // piece -> deadline (ms) most recently requested; scheduler thread only
 };
 

@@ -4,6 +4,8 @@
 #include <libtorrent/torrent_status.hpp>
 #include <algorithm>
 #include <cstring>
+#include <netdb.h>
+#include <sys/socket.h>
 #include "tpcore/audit.hpp"
 
 namespace fs = std::filesystem;
@@ -11,6 +13,7 @@ namespace tp {
 
 using Clock = std::chrono::steady_clock;
 static double secs(Clock::duration d) { return std::chrono::duration<double>(d).count(); }
+static void resolve_web_urls(std::vector<std::string> urls, std::shared_ptr<WebEpMap> out);      // web-seed stall remedy, defined below
 
 static std::string hex_of(const lt::sha1_hash& h) {
   static const char* d = "0123456789abcdef";
@@ -128,6 +131,10 @@ void StreamSession::start(const TorrentSource& src) {
   h_ = eng_.session().add_torrent(atp);
   for (auto const& u : web_urls_) h_.remove_url_seed(u);           // the policy decides when web seeds are used
   if (src.strip_trackers) h_.replace_trackers({});
+  if (!web_urls_.empty() && !strip_web_always_) {                  // one background pass over at most 16 URLs; detached on purpose: getaddrinfo cannot be cancelled and must not delay shutdown
+    web_ep_ = std::make_shared<WebEpMap>();
+    std::thread([urls = std::vector<std::string>(web_urls_.begin(), web_urls_.begin() + std::min<std::size_t>(web_urls_.size(), 16)), m = web_ep_] { resolve_web_urls(urls, m); }).detach();
+  }
   th_ = std::thread([this] { scheduler_loop(); });
 }
 
@@ -205,6 +212,93 @@ void StreamSession::on_alert(lt::alert* a) {
 bool StreamSession::is_web_endpoint(const lt::tcp::endpoint& ep) {
   std::lock_guard<std::mutex> g(ips_mu_);
   return std::find(web_ips_.begin(), web_ips_.end(), ep.address().to_string()) != web_ips_.end();
+}
+
+// ============================================================== web-seed stall remedy
+// Observed live (Internet Archive torrent) and reproduced offline (tests/integration/it_webseed_starvation.cpp): libtorrent hands the blocks of the most urgent piece to
+// whichever web-seed connection is ready first. A seed that accepts the connection but never answers keeps those blocks until its inactivity timeout (about 20 s) and, after
+// reconnecting, is given them again, while the one working seed spends its bandwidth on other pieces. The remedy is narrow: only when the READER is blocked, only a web-seed
+// connection that (a) owns requested blocks of the piece the reader needs, (b) has received nothing for kWebStallSeconds and (c) has requests queued, and only while another
+// source IS delivering data (a sole slow source is never touched). That seed is removed (libtorrent returns its blocks to the picker) and re-added after a penalty that doubles
+// per repeat (30 s .. 240 s). Slow but flowing seeds, peers and healthy startup are untouched; no global timeout changes.
+static constexpr double kWebStallSeconds = 8.0;
+
+// Resolves every URL's host once. A failed lookup simply leaves that URL unmapped (it is then never released: the remedy only acts on connections it can attribute to exactly one URL).
+static void resolve_web_urls(std::vector<std::string> urls, std::shared_ptr<WebEpMap> out) {
+  std::map<std::string, std::vector<std::string>> m;
+  for (auto const& u : urls) {
+    const auto se = u.find("://"); if (se == std::string::npos) continue;
+    const std::string scheme = u.substr(0, se);
+    const auto hs = se + 3;
+    std::string host, port = scheme == "https" ? "443" : "80";
+    std::string::size_type after;
+    if (hs < u.size() && u[hs] == '[') { const auto be = u.find(']', hs); if (be == std::string::npos) continue; host = u.substr(hs + 1, be - hs - 1); after = be + 1; }   // IPv6 literal
+    else { const auto he = u.find_first_of(":/", hs); host = u.substr(hs, he == std::string::npos ? std::string::npos : he - hs); after = he == std::string::npos ? u.size() : he; }
+    if (after < u.size() && u[after] == ':') { const auto pe = u.find('/', after); port = u.substr(after + 1, pe == std::string::npos ? std::string::npos : pe - after - 1); }
+    addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    if (host.empty() || ::getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) continue;
+    for (addrinfo* r = res; r; r = r->ai_next) {
+      char b[NI_MAXHOST];
+      if (::getnameinfo(r->ai_addr, r->ai_addrlen, b, sizeof b, nullptr, 0, NI_NUMERICHOST) != 0) continue;
+      lt::error_code ec; auto a = lt::make_address(std::string(b).substr(0, std::string(b).find('%')), ec);
+      if (ec) continue;
+      auto& v = m[a.to_string() + ":" + port];
+      if (std::find(v.begin(), v.end(), u) == v.end()) v.push_back(u);
+    }
+    ::freeaddrinfo(res);
+  }
+  std::lock_guard<std::mutex> g(out->mu);
+  out->m = std::move(m);
+}
+
+void StreamSession::release_stalled_web_seeds(double) {
+  const auto now = Clock::now();
+  for (auto& kv : web_stall_) {                                       // penalty over: put the seed back (libtorrent's own retry handling takes over from there)
+    if (kv.second.off && now >= kv.second.until) {
+      kv.second.off = false;
+      if (web_enabled_ && !strip_web_always_) { h_.add_url_seed(kv.first); log_event("web seed back after its penalty (strike " + std::to_string(kv.second.strikes) + ")"); }
+    }
+  }
+  if (!web_enabled_ || strip_web_always_ || blocked_.load() <= 0) return;
+  const int need = wait_cache_.piece;
+  if (need < 0) return;
+  std::vector<lt::peer_info> pi; h_.get_peer_info(pi);
+  std::vector<lt::tcp::endpoint> stalled;
+  bool other_source_delivering = false;
+  for (auto const& p : pi) {
+    if (p.payload_down_speed > 0) other_source_delivering = true;           // some source (peer or web seed) is delivering right now
+    if (p.connection_type != lt::peer_info::web_seed || p.download_queue_length <= 0) continue;
+    if (p.payload_down_speed > 0 || lt::total_milliseconds(p.last_active) < static_cast<int>(kWebStallSeconds * 1000)) continue;
+    stalled.push_back(p.ip);
+  }
+  if (stalled.empty() || !other_source_delivering) return;
+  std::vector<lt::partial_piece_info> q;
+  try { q = h_.get_download_queue(); } catch (std::exception const&) { return; }
+  std::vector<lt::tcp::endpoint> owners;                              // who holds requested blocks of the waited piece
+  for (auto const& pp : q) {
+    if (static_cast<int>(pp.piece_index) != need || !pp.blocks) continue;
+    for (int b = 0; b < pp.blocks_in_piece; ++b) if (pp.blocks[b].state == lt::block_info::requested && pp.blocks[b].num_peers > 0) owners.push_back(pp.blocks[b].peer());
+  }
+  for (auto const& ep : stalled) {
+    if (std::find(owners.begin(), owners.end(), ep) == owners.end()) continue;
+    std::string url;
+    if (web_ep_) {
+      std::lock_guard<std::mutex> g(web_ep_->mu);
+      auto it = web_ep_->m.find(ep.address().to_string() + ":" + std::to_string(ep.port()));
+      if (it != web_ep_->m.end() && it->second.size() == 1) url = it->second.front();      // two URLs on one server cannot be told apart: leave those to libtorrent
+    }
+    if (url.empty() || web_seed_off(url)) continue;                   // not one of the resolved seeds (for example a redirect target): leave it to libtorrent
+    auto& st = web_stall_[url];
+    if (st.strikes > 0 && now - st.last_release > std::chrono::minutes(10)) st.strikes = 0;     // it behaved for a long time: start the penalties over
+    ++st.strikes; st.off = true; st.last_release = now;
+    const int penalty_s = std::min(240, 30 << std::min(st.strikes - 1, 3));
+    st.until = now + std::chrono::seconds(penalty_s);
+    h_.remove_url_seed(url);
+    const auto idx = std::find(web_urls_.begin(), web_urls_.end(), url) - web_urls_.begin();
+    log_event("released stalled web seed #" + std::to_string(idx) + ": it holds requested blocks of piece " + std::to_string(need) + " that the reader waits for and delivered nothing for " +
+              std::to_string(static_cast<int>(kWebStallSeconds)) + " s while another source delivers; off for " + std::to_string(penalty_s) + " s (strike " + std::to_string(st.strikes) + ")");
+  }
 }
 
 // ============================================================== scheduler
@@ -439,11 +533,12 @@ void StreamSession::tick() {
     WebSeedAction act;
     { std::lock_guard<std::mutex> g(cfg_mu_); act = web_policy_.update(ws); }
     if (!strip_web_always_) {
-      if (act == WebSeedAction::Enable) { for (auto const& u : web_urls_) h_.add_url_seed(u); log_event("web seed policy: ENABLE"); }
-      else if (act == WebSeedAction::Disable) { for (auto const& u : web_urls_) h_.remove_url_seed(u); log_event("web seed policy: DISABLE"); }
+      if (act == WebSeedAction::Enable) { web_enabled_ = true; for (auto const& u : web_urls_) if (!web_seed_off(u)) h_.add_url_seed(u); log_event("web seed policy: ENABLE"); }
+      else if (act == WebSeedAction::Disable) { web_enabled_ = false; for (auto const& u : web_urls_) h_.remove_url_seed(u); log_event("web seed policy: DISABLE"); }
     }
   }
   if (tick_no % 10 == 5 && s.num_peers > 0) update_known_peers();                 // every second while any peer is connected
+  if (tick_no % 10 == 7 && !checking) { try { release_stalled_web_seeds(t); } catch (std::exception const& e) { log_event(std::string("web seed stall check exception: ") + e.what()); } }
   if (tick_no % 10 == 3 && !checking) { try { update_wait_info(t); } catch (std::exception const& e) { log_event(std::string("wait diagnostics exception: ") + e.what()); } }
 
   // ---- window plan, protection, eviction, reconciliation
