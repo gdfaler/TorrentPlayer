@@ -171,6 +171,27 @@ with open(inv, "w") as w:
 print("bundled %d libraries" % len(name_of))
 PY
 
+echo "== 3b/6 MoltenVK (the Vulkan driver mpv renders through; the loader dlopens it via an ICD file, so it is not part of the linked closure)"
+MVK=$(readlink -f /opt/homebrew/opt/molten-vk)
+[ -f "$MVK/lib/libMoltenVK.dylib" ] || { echo "FAIL: molten-vk is not installed in Homebrew ($MVK)" >&2; exit 1; }
+cp "$MVK/lib/libMoltenVK.dylib" "$APP/Contents/Frameworks/libMoltenVK.dylib"
+chmod 755 "$APP/Contents/Frameworks/libMoltenVK.dylib"
+install_name_tool -id @rpath/libMoltenVK.dylib "$APP/Contents/Frameworks/libMoltenVK.dylib"
+mkdir -p "$APP/Contents/Resources/vulkan/icd.d"
+MVK_API=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['ICD']['api_version'])" "$MVK/etc/vulkan/icd.d/MoltenVK_icd.json")
+cat > "$APP/Contents/Resources/vulkan/icd.d/MoltenVK_icd.json" <<ICD
+{
+    "file_format_version" : "1.0.0",
+    "ICD": {
+        "library_path": "../../../Frameworks/libMoltenVK.dylib",
+        "api_version" : "$MVK_API",
+        "is_portability_driver" : true
+    }
+}
+ICD
+MVK_VER=$(basename "$MVK"); MVK_LIC=$(grep -m1 '^  license ' "$MVK/.brew/molten-vk.rb" 2>/dev/null | sed 's/^ *//' || true)
+printf 'libMoltenVK.dylib (loaded at run time through Resources/vulkan/icd.d/MoltenVK_icd.json, not linked)\n  source:   %s/lib/libMoltenVK.dylib\n  formula:  molten-vk %s\n  license:  %s\n  minos:    %s\n\n' "$MVK" "$MVK_VER" "${MVK_LIC:-UNKNOWN}" "$(vtool -show-build "$APP/Contents/Frameworks/libMoltenVK.dylib" | awk '/minos/{print $2; exit}')" >> "$OUT/dependency_inventory.txt"
+
 echo "== 4/6 ad-hoc signing"
 for f in "$APP"/Contents/Frameworks/*.dylib; do codesign --force --sign - "$f" 2> /dev/null; done
 codesign --force --sign - "$APP" 2> /dev/null
@@ -198,6 +219,10 @@ check_file() {
 }
 check_file "$APP/Contents/MacOS/TorrentPlayer"
 for f in "$APP"/Contents/Frameworks/*.dylib; do check_file "$f"; done
+ICDJSON="$APP/Contents/Resources/vulkan/icd.d/MoltenVK_icd.json"
+[ -f "$ICDJSON" ] || { echo "FAIL missing ICD file"; fail=1; }
+ICDLIB=$(python3 -c "import json,os,sys; p=sys.argv[1]; print(os.path.normpath(os.path.join(os.path.dirname(p), json.load(open(p))['ICD']['library_path'])))" "$ICDJSON" 2> /dev/null)
+[ -f "$ICDLIB" ] || { echo "FAIL ICD library_path does not resolve inside the bundle: $ICDLIB"; fail=1; }
 plutil -lint "$APP/Contents/Info.plist" || fail=1
 BID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Contents/Info.plist")
 [ "$BID" = "io.github.gdfaler.TorrentPlayer" ] || { echo "FAIL bundle id: $BID"; fail=1; }

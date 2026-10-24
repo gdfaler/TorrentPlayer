@@ -76,6 +76,7 @@ final class GlassTestDriver {
     }
 
     func run(_ cmd: String, _ arg: String) {
+        guard window?.isVisible == true else { log("skipped", ["cmd": cmd, "reason": "its session has ended"]); return }          // a script step scheduled for a session that was closed meanwhile must not touch the destroyed player window
         switch cmd {
         case "click": click(arg, hidden: false)
         case "clickhidden": click(arg, hidden: true)

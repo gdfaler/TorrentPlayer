@@ -3,6 +3,12 @@ import AppKit
 
 setvbuf(stdout, nil, _IONBF, 0)
 
+// mpv draws through Vulkan (MoltenVK). The Vulkan loader finds the driver through an ICD file: use the one bundled in Resources, so the app does not depend on Homebrew's directories.
+// Builds without the bundled file (development builds) keep the loader's default search.
+if let icd = Bundle.main.url(forResource: "MoltenVK_icd", withExtension: "json", subdirectory: "vulkan/icd.d") {
+    setenv("VK_DRIVER_FILES", icd.path, 1); setenv("VK_ICD_FILENAMES", icd.path, 1)
+}
+
 func parseOptions() -> AppOptions {
     var o = AppOptions()
     var a = Array(CommandLine.arguments.dropFirst())
