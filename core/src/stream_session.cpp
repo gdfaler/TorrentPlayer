@@ -219,8 +219,13 @@ bool StreamSession::is_web_endpoint(const lt::tcp::endpoint& ep) {
 // whichever web-seed connection is ready first. A seed that accepts the connection but never answers keeps those blocks until its inactivity timeout (about 20 s) and, after
 // reconnecting, is given them again, while the one working seed spends its bandwidth on other pieces. The remedy is narrow: only when the READER is blocked, only a web-seed
 // connection that (a) owns requested blocks of the piece the reader needs, (b) has received nothing for kWebStallSeconds and (c) has requests queued, and only while another
-// source IS delivering data (a sole slow source is never touched). That seed is removed (libtorrent returns its blocks to the picker) and re-added after a penalty that doubles
+// source that can serve the waited piece IS delivering data (a sole slow source, or a source that is merely busy with other pieces, never counts). That seed is removed (libtorrent returns its blocks to the picker) and re-added after a penalty that doubles
 // per repeat (30 s .. 240 s). Slow but flowing seeds, peers and healthy startup are untouched; no global timeout changes.
+// "Can serve the piece" is read from the peer's own advertised piece set (peer_info::pieces). libtorrent builds that set exactly when a web connection opens, but a seed it learned
+// through a per-file redirect may later advertise boundary pieces that also span files it does not have. So for a piece that spans several files a web seed only counts when its
+// advertised set also contains a piece lying entirely inside EACH file the piece spans (those are advertised only for files the seed really knows); a file too small to hold a
+// whole piece can only be vouched for by an endpoint that maps to exactly one configured URL. BitTorrent peers always count. If that cannot be established the stalled seed is kept:
+// it may be the only source that holds every file slice of the piece (observed: a slow first response from the plain seed plus a redirected seed that knows only the MP4).
 static constexpr double kWebStallSeconds = 8.0;
 
 // Resolves every URL's host once. A failed lookup simply leaves that URL unmapped (it is then never released: the remedy only acts on connections it can attribute to exactly one URL).
@@ -266,8 +271,31 @@ void StreamSession::release_stalled_web_seeds(double) {
   std::vector<lt::peer_info> pi; h_.get_peer_info(pi);
   std::vector<lt::tcp::endpoint> stalled;
   bool other_source_delivering = false;
+  std::vector<lt::file_index_t> spanned;                                    // files with real data in the waited piece (BEP 47 padding excluded)
+  try {
+    const auto& fs = ti_->files();
+    for (auto const& sl : ti_->map_block(lt::piece_index_t(need), 0, ti_->piece_size(lt::piece_index_t(need)))) if (!fs.pad_file_at(sl.file_index)) spanned.push_back(sl.file_index);
+  } catch (std::exception const&) { return; }
+  auto single_configured_url = [&](lt::tcp::endpoint const& ep) {            // the endpoint is exactly one configured web-seed URL, not a redirect target and not shared
+    if (!web_ep_) return false;
+    std::lock_guard<std::mutex> g(web_ep_->mu);
+    auto it = web_ep_->m.find(ep.address().to_string() + ":" + std::to_string(ep.port()));
+    return it != web_ep_->m.end() && it->second.size() == 1;
+  };
+  auto web_seed_has_all_files = [&](lt::peer_info const& p) {                // evidence that a web seed knows every file of the waited piece (see the note above)
+    const auto& fs = ti_->files(); const std::int64_t ps = ti_->piece_length();
+    for (auto const f : spanned) {
+      const std::int64_t off = fs.file_offset(f), end = off + fs.file_size(f);
+      const std::int64_t first = (off + ps - 1) / ps, last = end / ps - 1;      // pieces lying entirely inside the file
+      if (first <= last) { if (first >= static_cast<std::int64_t>(p.pieces.size()) || !p.pieces.get_bit(lt::piece_index_t(static_cast<int>(first)))) return false; }
+      else if (!single_configured_url(p.ip)) return false;
+    }
+    return true;
+  };
   for (auto const& p : pi) {
-    if (p.payload_down_speed > 0) other_source_delivering = true;           // some source (peer or web seed) is delivering right now
+    // a source counts as an alternative only if it delivers right now AND advertises the waited piece; a source busy with other pieces (or one that is merely connected) does not
+    if (p.payload_down_speed > 0 && static_cast<int>(p.pieces.size()) > need && p.pieces.get_bit(lt::piece_index_t(need)) &&
+        (spanned.size() <= 1 || p.connection_type != lt::peer_info::web_seed || web_seed_has_all_files(p))) other_source_delivering = true;
     if (p.connection_type != lt::peer_info::web_seed || p.download_queue_length <= 0) continue;
     if (p.payload_down_speed > 0 || lt::total_milliseconds(p.last_active) < static_cast<int>(kWebStallSeconds * 1000)) continue;
     stalled.push_back(p.ip);
