@@ -2,7 +2,7 @@
 
 A native macOS video player that can play a local video file, or stream a video from a torrent or magnet link while it downloads. It is written in Swift/AppKit with a C++ streaming core ([libtorrent](https://libtorrent.org)) and [mpv](https://mpv.io) for playback.
 
-> **Status: first public MVP.** It is free software, but it is **not notarized** by Apple and has so far only been run on the developer's own Mac. See [Known limitations](#known-limitations).
+> **Status: first public MVP.** It is free software, but it is **not notarized** by Apple and has so far only been run on the developer's own Mac. Local video playback is the most thoroughly tested part; torrent streaming passed controlled tests and has worked once on a public torrent, but its reliability on the public internet is limited and has not been comprehensively validated. See [What has been tested](#what-has-been-tested) and [Known limitations](#known-limitations).
 
 ## Requirements
 - A Mac with **Apple silicon** (arm64). Intel Macs are not supported.
@@ -31,24 +31,40 @@ A native macOS video player that can play a local video file, or stream a video 
 - **Keys:** Space pause · ←/→ seek 5 s (Shift: 30 s) · ↑/↓ volume · M mute · F fullscreen · E show more/fewer controls · R retry after an error · Esc leave fullscreen. The Playback menu offers the same actions.
 - **Appearance:** System, Light or Dark for the home screen (bottom of the window or View ▸ Home Appearance).
 
+## What has been tested
+**Verified**
+- Local video playback, including with Homebrew's runtime paths made unavailable to the app (the app bundles everything it needs).
+- Torrent streaming in two controlled end-to-end tests on one Mac, using a small test video and only the local machine: once from a real BitTorrent peer and once from an HTTP web seed. In both, every piece was downloaded and checked, playback started within a few seconds and the position advanced steadily, with no crash and no stall.
+
+**Public internet: mixed**
+- Playback of a public torrent has succeeded: an earlier build started the Internet Archive's Big Buck Bunny torrent, but only after about 85 seconds.
+- The latest build did **not** start the same torrent within 150 seconds, because one piece of the video, which spans two files in the torrent, was never delivered by the web seed that could serve it.
+- Reliability on public torrents is therefore limited and has not been comprehensively validated. Public trackers, DHT peer discovery and HTTPS trackers have not been comprehensively tested; in one test some HTTPS tracker connections failed during the TLS handshake.
+
+**Still to do**
+- Installing and running on a second Mac.
+- A person confirming the picture and sound. The automated tests confirm that the video decoder and audio output start and that playback time advances, not what is seen or heard.
+
 ## Where TorrentPlayer keeps things
 - Streaming cache: `~/Library/Caches/TorrentPlayer/stream` (bounded, 2 GiB by default; it is not your Downloads folder).
 - Local log of what the app did, for troubleshooting: `~/Library/Logs/TorrentPlayer/` (File ▸ Reveal Telemetry Log in Finder). It stays on your Mac, is never sent anywhere, and can contain torrent and file names.
 - Preferences and the recent-files list: the app's standard preferences file.
 
 ## Known limitations
-- Not notarized, and not yet verified on any Mac other than the developer's. Please report what you find.
+- Not notarized (ad-hoc signed), and not yet verified on any Mac other than the developer's. Please report what you find.
+- Torrent startup needs at least one responsive BitTorrent peer or web seed. If the only source is slow or silent, the player can sit on "Preparing playback" for a long time or never start.
+- Some web seeds (the Internet Archive is one) redirect each file to a different server. The torrent library then handles pieces that span two files poorly, which can delay or prevent the start of playback.
 - Dragging the seek bar in a torrent jumps to the nearest keyframe (local files seek exactly).
 - Rarely, closing a window can leave the player's shutdown waiting for several seconds before the home screen returns.
 - After leaving fullscreen the window occasionally does not return to its previous size or position.
 - Contrast of the on-screen controls over very bright video is low (a design trade-off); keyboard Tab navigation of the controls and VoiceOver support have not been verified.
-- HTTPS-only trackers may fail certificate verification on a Mac without a developer toolchain (unverified).
+- HTTPS tracker connectivity has not been fully validated: some tested connections failed during the TLS handshake, and the cause was not determined.
 - No subtitle controls yet.
 - BitTorrent is a tool: you are responsible for what you download or stream and for complying with the law where you live.
 
 ## Troubleshooting
 - *"TorrentPlayer can't be opened"*: see step 3 above.
-- *A torrent finds no peers*: the link may be dead or your network may block BitTorrent; try another link.
+- *A torrent finds no peers, or stays on "Preparing playback"*: the link may be dead, its web seed may be unresponsive, or your network or VPN may block BitTorrent or tracker traffic. Try another link or network.
 - *Video does not start*: check File ▸ Reveal Telemetry Log in Finder and open an issue with the last lines (remove anything private).
 
 ## Build from source
