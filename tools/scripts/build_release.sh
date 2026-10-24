@@ -192,6 +192,15 @@ ICD
 MVK_VER=$(basename "$MVK"); MVK_LIC=$(grep -m1 '^  license ' "$MVK/.brew/molten-vk.rb" 2>/dev/null | sed 's/^ *//' || true)
 printf 'libMoltenVK.dylib (loaded at run time through Resources/vulkan/icd.d/MoltenVK_icd.json, not linked)\n  source:   %s/lib/libMoltenVK.dylib\n  formula:  molten-vk %s\n  license:  %s\n  minos:    %s\n\n' "$MVK" "$MVK_VER" "${MVK_LIC:-UNKNOWN}" "$(vtool -show-build "$APP/Contents/Frameworks/libMoltenVK.dylib" | awk '/minos/{print $2; exit}')" >> "$OUT/dependency_inventory.txt"
 
+echo "== 3c/6 licences, attributions and source manifest for exactly what was bundled (offline; see tools/scripts/gen_third_party.py)"
+APPVER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$ROOT/app/Resources/Info.plist")
+SRCARGS=(); [ -d "${TP_THIRD_PARTY_SOURCES:-$D/sources/$APPVER}" ] && SRCARGS=(--sources "${TP_THIRD_PARTY_SOURCES:-$D/sources/$APPVER}")      # fetched with tools/scripts/fetch_third_party_sources.py; adds the upstream licence files
+python3 "$ROOT/tools/scripts/gen_third_party.py" --app "$APP" --inventory "$OUT/dependency_inventory.txt" --out "$OUT/third_party" --repo-root "$ROOT" ${SRCARGS[@]+"${SRCARGS[@]}"}
+mkdir -p "$APP/Contents/Resources/Licenses"
+cp "$OUT/third_party/LICENSE-GPL-3.0.txt" "$APP/Contents/Resources/Licenses/LICENSE-GPL-3.0.txt"
+for f in LICENSE THIRD_PARTY_NOTICES.md SOURCE_OFFER.txt source-manifest.tsv; do [ -f "$OUT/third_party/$f" ] && cp "$OUT/third_party/$f" "$APP/Contents/Resources/Licenses/$f"; done
+cp -R "$OUT/third_party/licenses" "$APP/Contents/Resources/Licenses/licenses"
+
 echo "== 4/6 ad-hoc signing"
 for f in "$APP"/Contents/Frameworks/*.dylib; do codesign --force --sign - "$f" 2> /dev/null; done
 codesign --force --sign - "$APP" 2> /dev/null
@@ -219,6 +228,7 @@ check_file() {
 }
 check_file "$APP/Contents/MacOS/TorrentPlayer"
 for f in "$APP"/Contents/Frameworks/*.dylib; do check_file "$f"; done
+for f in LICENSE THIRD_PARTY_NOTICES.md SOURCE_OFFER.txt source-manifest.tsv LICENSE-GPL-3.0.txt; do [ -f "$APP/Contents/Resources/Licenses/$f" ] || { echo "FAIL missing licence material: $f"; fail=1; }; done
 ICDJSON="$APP/Contents/Resources/vulkan/icd.d/MoltenVK_icd.json"
 [ -f "$ICDJSON" ] || { echo "FAIL missing ICD file"; fail=1; }
 ICDLIB=$(python3 -c "import json,os,sys; p=sys.argv[1]; print(os.path.normpath(os.path.join(os.path.dirname(p), json.load(open(p))['ICD']['library_path'])))" "$ICDJSON" 2> /dev/null)

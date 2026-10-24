@@ -1,23 +1,63 @@
 # TorrentPlayer
 
-Native macOS torrent streaming player (personal build for this Mac). Streams a video file from a torrent through libtorrent into mpv with a strictly bounded, self-reclaiming cache.
+A native macOS video player that can play a local video file, or stream a video from a torrent or magnet link while it downloads. It is written in Swift/AppKit with a C++ streaming core ([libtorrent](https://libtorrent.org)) and [mpv](https://mpv.io) for playback.
 
-## Build (Command Line Tools + Homebrew only; no Xcode)
+> **Status: first public MVP.** It is free software, but it is **not notarized** by Apple and has so far only been run on the developer's own Mac. See [Known limitations](#known-limitations).
+
+## Requirements
+- A Mac with **Apple silicon** (arm64). Intel Macs are not supported.
+- **macOS 27** or later.
+- Nothing else: the download is self-contained (mpv, FFmpeg, libtorrent and the Vulkan/Metal driver are inside the app). Homebrew is **not** needed to run it.
+
+## Install and first launch
+1. Download `TorrentPlayer-<version>-macos-arm64.zip` from the [Releases](https://github.com/gdfaler/TorrentPlayer/releases) page, and check it against `SHA256SUMS`:
+   ```bash
+   shasum -a 256 -c SHA256SUMS
+   ```
+2. Double-click the ZIP to unpack it and drag **TorrentPlayer.app** to your Applications folder.
+3. **The app is not notarized**, because the project has no Apple Developer ID. It is signed ad hoc, so macOS Gatekeeper will refuse the first launch ("cannot be opened because Apple cannot check it for malicious software"). To allow *this one app*:
+   - Open TorrentPlayer once and dismiss the warning, then open **System Settings ▸ Privacy & Security**, scroll to the Security section and choose **Open Anyway** next to TorrentPlayer, then confirm. (The exact wording and layout differ between macOS versions; it has not been checked on macOS 27.)
+   - Or, if you prefer the Terminal, remove the download quarantine flag from this app only:
+     ```bash
+     xattr -dr com.apple.quarantine /Applications/TorrentPlayer.app
+     ```
+   Do not turn Gatekeeper off globally. If you do not trust a download, build the app yourself (below).
+4. The first time you open a torrent, macOS may ask whether TorrentPlayer may accept incoming network connections. BitTorrent works best if you allow it; the choice is yours.
+
+## Using it
+- **Local video:** *Open File…*, ⌘O, drag a video onto the window, or double-click a video with *Open With ▸ TorrentPlayer*. Supported containers include mp4, m4v, mov, mkv, webm, avi, mpg/mpeg, wmv, ts and flv. Audio-only files are not supported yet.
+- **Torrent:** *Open Torrent…* (⇧⌘O), drop a `.torrent` file, paste a magnet link into the field (or ⌘L to open the one on the clipboard), then pick a video file and press Play. Playback starts while the file is still downloading.
+- **Recent files:** the last 10 local videos you played are listed on the home screen (nothing is stored for torrents). *Clear All* removes the list; your files are never touched.
+- **Keys:** Space pause · ←/→ seek 5 s (Shift: 30 s) · ↑/↓ volume · M mute · F fullscreen · E show more/fewer controls · R retry after an error · Esc leave fullscreen. The Playback menu offers the same actions.
+- **Appearance:** System, Light or Dark for the home screen (bottom of the window or View ▸ Home Appearance).
+
+## Where TorrentPlayer keeps things
+- Streaming cache: `~/Library/Caches/TorrentPlayer/stream` (bounded, 2 GiB by default; it is not your Downloads folder).
+- Local log of what the app did, for troubleshooting: `~/Library/Logs/TorrentPlayer/` (File ▸ Reveal Telemetry Log in Finder). It stays on your Mac, is never sent anywhere, and can contain torrent and file names.
+- Preferences and the recent-files list: the app's standard preferences file.
+
+## Known limitations
+- Not notarized, and not yet verified on any Mac other than the developer's. Please report what you find.
+- Dragging the seek bar in a torrent jumps to the nearest keyframe (local files seek exactly).
+- Rarely, closing a window can leave the player's shutdown waiting for several seconds before the home screen returns.
+- After leaving fullscreen the window occasionally does not return to its previous size or position.
+- Contrast of the on-screen controls over very bright video is low (a design trade-off); keyboard Tab navigation of the controls and VoiceOver support have not been verified.
+- HTTPS-only trackers may fail certificate verification on a Mac without a developer toolchain (unverified).
+- No subtitle controls yet.
+- BitTorrent is a tool: you are responsible for what you download or stream and for complying with the law where you live.
+
+## Troubleshooting
+- *"TorrentPlayer can't be opened"*: see step 3 above.
+- *A torrent finds no peers*: the link may be dead or your network may block BitTorrent; try another link.
+- *Video does not start*: check File ▸ Reveal Telemetry Log in Finder and open an issue with the last lines (remove anything private).
+
+## Build from source
+Requirements: macOS 27 on Apple silicon, the Xcode Command Line Tools (no full Xcode needed) and Homebrew packages `cmake ninja pkg-config boost libtorrent-rasterbar openssl@3 mpv molten-vk`.
 ```bash
-tools/scripts/build_app.sh          # builds core (CMake/Ninja), the Swift app (swiftc), ad-hoc signs build/TorrentPlayer.app
-ctest --test-dir build -L unit      # fast unit tests
+tools/scripts/build_release.sh my-build      # builds the C++ core and the Swift app into dist/my-build/TorrentPlayer.app, bundles every library, signs ad hoc
+tools/scripts/package_release.sh my-build    # ZIP, checksums, build metadata, notices, source archive (dist/release/)
 ```
-Prerequisites (Homebrew): libtorrent-rasterbar, boost, openssl@3, mpv, cmake, ninja, pkg-config. See `docs/DISTRIBUTION_NOTES.md` (own-Mac use only).
+The build bundles the libraries *your* Homebrew has installed; the release ZIP was built against the versions listed in `THIRD_PARTY_NOTICES.md`. Developer build for your own Mac: `tools/scripts/build_app.sh`. Unit tests: see `tests/app/*_test.swift` (each file lists its build command) and `ctest --test-dir build -L unit` for the core.
 
-## Launch
-```bash
-open build/TorrentPlayer.app
-```
-Then drop a `.torrent` onto the window, press "Open Torrent…", or paste a magnet link (Cmd-L reads the clipboard). Pick a video file, press Play. Keys: Space pause, ←/→ seek 5 s (Shift: 30 s), ↑/↓ volume, M mute, F fullscreen, R retry after an error, Cmd-O open. The first launch may show a macOS firewall question about incoming connections (BitTorrent needs them; answering is your choice).
-
-## Where things are
-- Streaming cache: `~/Library/Caches/TorrentPlayer/stream` (2 GiB default limit). Telemetry: `~/Library/Logs/TorrentPlayer/` (File > Reveal Telemetry Log in Finder).
-- Docs: `docs/ARCHITECTURE_M2.md`, `docs/MILESTONE1_STATUS.md`, `docs/MILESTONE2_STATUS.md`, `docs/DISTRIBUTION_NOTES.md`. Raw evidence: `docs/gate_results/`.
-
-## Tests
-Loopback integration: `ctest --test-dir build -L integration` (long). App acceptance autotests: `python3 -I tests/app/app_autotests.py [scenario...]`. M1 gates on the current build: `tools/scripts/run_m1_regression.sh`. First real-swarm playback: `tools/scripts/run_m2_realswarm.sh` (AC power, lid open).
+## Licence
+Copyright © 2026 gdfaler. TorrentPlayer is licensed under the **GNU General Public License, version 3 or (at your option) any later version** — see [LICENSE](LICENSE). The app bundles third-party libraries, among them FFmpeg, mpv, x264, x265 and rubberband (GPL) and several LGPL libraries; each keeps its own licence and copyright. Their notices and licence texts are in `THIRD_PARTY_NOTICES.md` and, inside the app, in `TorrentPlayer.app/Contents/Resources/Licenses`. The corresponding source for a release (TorrentPlayer and the bundled libraries) is attached to that release; see `SOURCE_OFFER.txt`. The software comes with **no warranty**. Audio and video codecs may be covered by patents in some countries; this project gives no patent licence.
