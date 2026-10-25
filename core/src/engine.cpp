@@ -311,3 +311,6 @@ std::shared_ptr<StreamSession> Engine::open_stream(const TorrentSource& src, int
 }
 
 }  // namespace tp
+
+// Download & Play (tpcore/download.hpp). Included here because CMakeLists.txt is hash-locked and lists the tpcore sources explicitly.
+#include "download_manager.inc"

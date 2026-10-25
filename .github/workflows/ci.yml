@@ -51,6 +51,8 @@ jobs:
         run: brew install cmake ninja pkg-config boost libtorrent-rasterbar openssl@3
       - name: Build and run the unit tests
         run: tools/scripts/ci_core_unit_tests.sh ci_build
+      - name: Download & Play core tests (loopback subset)
+        run: tools/scripts/run_download_tests.sh ci_build selected_file whole_torrent magnet resume_new_session resume_missing cancel destination_errors network_loss_and_restore
 
   swift-unit-tests:
     name: Swift unit tests (macOS arm64)
