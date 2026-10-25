@@ -90,6 +90,31 @@ struct DownloadRowModel: Equatable {
     }
 }
 
+/// What a click means, decided from the CURRENT list at click time (never from a snapshot captured when the row was built).
+enum DownloadClick {
+    enum PauseResume: Equatable { case pause(String), resume(String), ignore }
+    static func item(_ id: String, in items: [DownloadItem]) -> DownloadItem? { items.first { $0.id == id } }
+    static func pauseResume(id: String, in items: [DownloadItem]) -> PauseResume {
+        guard let d = item(id, in: items) else { return .ignore }                  // the row's download is gone
+        let m = DownloadRowModel.make(d)
+        return m.canResume ? .resume(id) : (m.canPause ? .pause(id) : .ignore)
+    }
+    static func playPath(id: String, in items: [DownloadItem]) -> String? {
+        guard let d = item(id, in: items), d.state == .completed, !d.primaryFile.isEmpty else { return nil }
+        return d.primaryFile
+    }
+    /// The file to select in Finder (nil: open the folder instead) and the folder; nil when the download no longer exists.
+    static func revealTarget(id: String, in items: [DownloadItem]) -> (file: String?, folder: String)? {
+        guard let d = item(id, in: items) else { return nil }
+        return (d.primaryFile.isEmpty ? nil : d.primaryFile, d.savePath)
+    }
+    enum CancelPrompt: Equatable { case gone, completed(name: String), partial(name: String, verified: Int64) }
+    static func cancelPrompt(id: String, in items: [DownloadItem]) -> CancelPrompt {
+        guard let d = item(id, in: items) else { return .gone }
+        return d.state == .completed ? .completed(name: d.name) : .partial(name: d.name, verified: d.verifiedBytes)
+    }
+}
+
 enum DownloadAutoPlay {
     /// A finished download starts playing by itself only if the user asked for that, it has not done so before and the player is not busy with something else.
     static func shouldStart(_ d: DownloadItem, alreadyHandled: Set<String>, playerBusy: Bool) -> Bool {

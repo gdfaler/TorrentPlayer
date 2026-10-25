@@ -41,6 +41,9 @@ struct DownloadRequest {
   bool auto_play = true;
   bool start_paused = false;                                // starts as "paused by user"
   bool strip_trackers = false;                              // tests: no tracker/DHT discovery
+  // internal, set by restore(): what the persisted state already knows
+  bool restoring = false;
+  std::vector<int> known_preexisting;                       // files that were on disk before this download first started (never deleted by this download)
 };
 
 struct DownloadStatus {

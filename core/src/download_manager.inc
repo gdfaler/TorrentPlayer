@@ -12,6 +12,7 @@
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/write_resume_data.hpp>
 #include <libtorrent/peer_info.hpp>
+#include <set>
 #include "tpcore/download.hpp"
 
 namespace tp {
@@ -37,6 +38,8 @@ struct DownloadManager::Entry {
   fs::path save_path;
   std::vector<int> files;
   std::vector<std::string> extra_peers;
+  std::vector<int> preexisting;                              // torrent files that existed before this download first started: never deleted by it
+  std::vector<std::string> fingerprint;                      // size:mtime of each selected file when the download completed (restart fast path)
   bool auto_play = true, user_paused = false, net_paused = false, completed = false, failed = false;
   std::int64_t selected_bytes = 0, last_verified = 0;
   std::chrono::steady_clock::time_point resuming_since{}, no_source_since{}, last_redial{}, last_resume_save{};
@@ -61,6 +64,11 @@ bool read_all(const fs::path& p, std::vector<char>* out) {
   std::ifstream f(p, std::ios::binary); if (!f) return false;
   out->assign(std::istreambuf_iterator<char>(f), {});
   return true;
+}
+std::string file_fingerprint(const fs::path& p) {            // "size:mtime" or "" when the file is missing
+  std::error_code ec; const auto sz = fs::file_size(p, ec); if (ec) return "";
+  const auto mt = fs::last_write_time(p, ec); if (ec) return "";
+  return std::to_string(static_cast<unsigned long long>(sz)) + ":" + std::to_string(static_cast<long long>(mt.time_since_epoch().count()));
 }
 bool is_video_name(const std::string& n) {
   static const char* exts[] = {".mkv", ".mp4", ".m4v", ".avi", ".webm", ".mov", ".ts", ".m2ts", ".mts", ".wmv", ".flv", ".mpg", ".mpeg", ".ogv", ".vob"};
@@ -126,6 +134,8 @@ void DownloadManager::persist_state(Entry& e) {
   d["user_paused"] = e.user_paused ? 1 : 0;
   d["auto_play"] = e.auto_play ? 1 : 0;
   d["completed"] = e.completed ? 1 : 0;
+  { lt::entry::list_type pre; for (int f : e.preexisting) pre.emplace_back(f); d["preexisting"] = lt::entry(std::move(pre)); }
+  { lt::entry::list_type fpl; for (auto& f : e.fingerprint) fpl.emplace_back(f); d["fingerprint"] = lt::entry(std::move(fpl)); }
   lt::entry::list_type pl; for (auto& p : e.extra_peers) pl.emplace_back(p);
   d["extra_peers"] = lt::entry(std::move(pl));
   std::vector<char> buf; lt::bencode(std::back_inserter(buf), d);
@@ -159,6 +169,20 @@ std::shared_ptr<DownloadManager::Entry> DownloadManager::add_locked(const Downlo
     std::sort(e->files.begin(), e->files.end()); e->files.erase(std::unique(e->files.begin(), e->files.end()), e->files.end());
   }
   for (int f : e->files) e->selected_bytes += fs_.file_size(lt::file_index_t(f));
+  // Two downloads must never share a file: they would overwrite each other's data (a neighbouring file of the torrent is written too where it shares a piece with a
+  // selected file) and one could delete the other's file. A download is refused if any file of its torrent is a selected file of another download or the other way round.
+  {
+    auto norm = [&](const fs::path& base, const lt::file_storage& st, int f) { return (base / st.file_path(lt::file_index_t(f))).lexically_normal(); };
+    std::set<fs::path> mine_sel, mine_all;
+    for (int f : e->files) mine_sel.insert(norm(req.save_path, fs_, f));
+    for (int f = 0; f < fs_.num_files(); ++f) mine_all.insert(norm(req.save_path, fs_, f));
+    for (auto& kv : entries_) {
+      if (!kv.second->ti) continue;
+      const auto& ofs = kv.second->ti->files();
+      for (int f : kv.second->files) { const auto other = norm(kv.second->save_path, ofs, f); if (mine_all.count(other)) return fail("The file " + other.string() + " is already used by another download."); }
+      for (int f = 0; f < ofs.num_files(); ++f) { const auto other = norm(kv.second->save_path, ofs, f); if (mine_sel.count(other)) return fail("The file " + other.string() + " is already used by another download."); }
+    }
+  }
   // destination: must exist (or be creatable) and be writable; enough free space for the selected files (not re-checked when restoring partial data)
   std::error_code fec;
   fs::create_directories(req.save_path, fec);
@@ -176,6 +200,8 @@ std::shared_ptr<DownloadManager::Entry> DownloadManager::add_locked(const Downlo
     if (avail >= 0 && avail < need)
       return fail("Not enough free space on the destination: " + std::to_string(need / (1024 * 1024)) + " MB needed, " + std::to_string(avail / (1024 * 1024)) + " MB available.");
   }
+  if (req.restoring) e->preexisting = req.known_preexisting;
+  else for (int i = 0; i < fs_.num_files(); ++i) { std::error_code xe; if (fs::exists(req.save_path / fs_.file_path(lt::file_index_t(i)), xe)) e->preexisting.push_back(i); }
   fs::create_directories(dir_of(id), fec);
   if (fec) return fail("Cannot create the download state folder.");
   if (!fs::exists(dir_of(id) / "meta.torrent")) write_atomic(dir_of(id) / "meta.torrent", req.torrent_bytes.data(), req.torrent_bytes.size());
@@ -234,7 +260,9 @@ int DownloadManager::restore() {
     DownloadRequest r; r.torrent_bytes = tb;
     r.save_path = std::string(n.dict_find_string_value("save_path"));
     r.auto_play = n.dict_find_int_value("auto_play", 1) != 0;
-    r.start_paused = n.dict_find_int_value("user_paused", 0) != 0;
+    r.start_paused = n.dict_find_int_value("user_paused", 0) != 0; r.restoring = true;
+    if (auto l = n.dict_find_list("preexisting")) for (int i = 0; i < l.list_size(); ++i) r.known_preexisting.push_back(static_cast<int>(l.list_int_value_at(i)));
+    std::vector<std::string> stored_fp; if (auto l = n.dict_find_list("fingerprint")) for (int i = 0; i < l.list_size(); ++i) stored_fp.push_back(std::string(l.list_string_value_at(i)));
     if (auto l = n.dict_find_list("files")) for (int i = 0; i < l.list_size(); ++i) r.files.push_back(static_cast<int>(l.list_int_value_at(i)));
     if (auto l = n.dict_find_list("extra_peers")) for (int i = 0; i < l.list_size(); ++i) r.extra_peers.push_back(std::string(l.list_string_value_at(i)));
     const bool was_completed = n.dict_find_int_value("completed", 0) != 0;
@@ -242,11 +270,19 @@ int DownloadManager::restore() {
     if (was_completed) {
       // a completed download stays "Completed" only while its files are still there; otherwise it is downloaded (rechecked) again
       lt::torrent_info ti(tb.data(), static_cast<int>(tb.size()));
-      bool all = !r.files.empty();
-      for (int f : r.files) { std::error_code fe; const auto p = r.save_path / ti.files().file_path(lt::file_index_t(f)); if (!fs::exists(p, fe) || static_cast<std::int64_t>(fs::file_size(p, fe)) != ti.files().file_size(lt::file_index_t(f))) all = false; }
+      // Trusted without re-hashing only if every selected file still has exactly the size and modification time recorded when it was verified. Anything else
+      // (a different size or timestamp, a missing file, no record) is treated as unverified: the torrent is added again and libtorrent re-checks the data against the
+      // piece hashes before it can complete (unchanged data is accepted without any transfer; damaged pieces are fetched again).
+      bool all = !r.files.empty() && stored_fp.size() == r.files.size();
+      for (std::size_t k = 0; all && k < r.files.size(); ++k) {
+        const int f = r.files[k]; const fs::path p = r.save_path / ti.files().file_path(lt::file_index_t(f));
+        const std::string fp = file_fingerprint(p);
+        if (fp.empty() || fp != stored_fp[k] || fp.substr(0, fp.find(':')) != std::to_string(static_cast<long long>(ti.files().file_size(lt::file_index_t(f))))) all = false;
+      }
       if (all) {
         auto e = std::make_shared<Entry>();
         e->id = hex20(ti.info_hashes().get_best()); e->name = ti.name(); e->save_path = r.save_path; e->files = r.files; e->auto_play = r.auto_play; e->completed = true;
+        e->preexisting = r.known_preexisting; e->fingerprint = stored_fp; e->extra_peers = r.extra_peers;
         e->ti = std::make_shared<lt::torrent_info>(tb.data(), static_cast<int>(tb.size()));
         for (int f : e->files) e->selected_bytes += ti.files().file_size(lt::file_index_t(f));
         entries_[e->id] = e;
@@ -345,9 +381,23 @@ bool DownloadManager::cancel(const std::string& id, bool delete_files) {
   auto it = entries_.find(id); if (it == entries_.end()) return false;
   std::shared_ptr<Entry> e = it->second;
   entries_.erase(it);
-  if (e->h.is_valid()) ses_->remove_torrent(e->h, delete_files ? lt::session::delete_files : lt::remove_flags_t{});
-  else if (delete_files && e->ti) { for (int f : e->files) { std::error_code ec; fs::remove(e->save_path / e->ti->files().file_path(lt::file_index_t(f)), ec); } }
-  std::error_code ec; fs::remove_all(dir_of(id), ec);                // only our own bookkeeping folder; downloaded files stay unless delete_files was requested
+  if (e->h.is_valid()) ses_->remove_torrent(e->h);                    // never libtorrent's delete_files: it removes every file of the torrent, including ones that were the user's
+  if (delete_files && e->ti) {
+    // Only files this download created are deleted: not files that were already in the folder when it started, and not files another download uses.
+    std::set<fs::path> claimed;
+    for (auto& kv : entries_) if (kv.second->ti) for (int f : kv.second->files) claimed.insert((kv.second->save_path / kv.second->ti->files().file_path(lt::file_index_t(f))).lexically_normal());
+    const auto& fs_ = e->ti->files();
+    for (int f = 0; f < fs_.num_files(); ++f) {
+      if (std::find(e->preexisting.begin(), e->preexisting.end(), f) != e->preexisting.end()) continue;
+      const fs::path p = (e->save_path / fs_.file_path(lt::file_index_t(f))).lexically_normal();
+      if (claimed.count(p)) continue;
+      std::error_code ec; fs::remove(p, ec);
+      for (fs::path dir = p.parent_path(); dir != e->save_path.lexically_normal() && dir.has_parent_path() && dir != dir.parent_path(); dir = dir.parent_path()) {   // empty folders this download created; never the destination itself
+        std::error_code de; if (!fs::is_empty(dir, de) || de) break; fs::remove(dir, de); if (de) break;
+      }
+    }
+  }
+  std::error_code ec; fs::remove_all(dir_of(id), ec);                // only our own bookkeeping folder
   return true;
 }
 
@@ -447,6 +497,7 @@ void DownloadManager::tick() {
   for (auto const& id : done) {
     Entry& e = *entries_[id];
     e.completed = true; e.failed = false; e.error.clear();
+    e.fingerprint.clear(); for (int f : e.files) e.fingerprint.push_back(file_fingerprint(e.save_path / e.ti->files().file_path(lt::file_index_t(f))));
     persist_state(e);
     ses_->remove_torrent(e.h);                                          // stop transferring; the verified files stay where the user put them
     e.h = lt::torrent_handle();

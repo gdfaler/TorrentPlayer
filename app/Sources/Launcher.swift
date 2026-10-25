@@ -445,7 +445,8 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         print("AUTOTEST DONE reason=\(reason) telemetry=\(telemetry.url.path)")
         fflush(stdout)
         telemetry.close()
-        NSApp.terminate(nil)
+        // not from inside a main-queue block: terminate runs a nested event loop in which the quit handler's deferred reply (a main-queue block) could never run
+        RunLoop.main.perform { NSApp.terminate(nil) }
     }
 
     // MARK: table

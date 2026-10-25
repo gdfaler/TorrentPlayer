@@ -84,7 +84,9 @@ final class DownloadRowView: NSTableCellView {
     let title = NSTextField(labelWithString: ""), detail = NSTextField(wrappingLabelWithString: ""), bar = NSProgressIndicator()
     let pauseButton = NSButton(title: "Pause", target: nil, action: nil), playButton = NSButton(title: "Play", target: nil, action: nil)
     let revealButton = NSButton(title: "Show in Finder", target: nil, action: nil), cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
-    var onPauseResume: (() -> Void)?, onPlay: (() -> Void)?, onReveal: (() -> Void)?, onCancel: (() -> Void)?
+    /// The download this (reused) row currently shows. Handlers receive it at click time and look the download up in the latest list.
+    var itemID = ""
+    var onPauseResume: ((String) -> Void)?, onPlay: ((String) -> Void)?, onReveal: ((String) -> Void)?, onCancel: ((String) -> Void)?
     private var lastModel: DownloadRowModel?
 
     override init(frame: NSRect) {
@@ -102,10 +104,10 @@ final class DownloadRowView: NSTableCellView {
                                      col.topAnchor.constraint(equalTo: topAnchor, constant: 8), bar.widthAnchor.constraint(equalTo: col.widthAnchor), detail.widthAnchor.constraint(equalTo: col.widthAnchor)])
     }
     required init?(coder: NSCoder) { fatalError() }
-    @objc private func pr() { onPauseResume?() }
-    @objc private func pl() { onPlay?() }
-    @objc private func rv() { onReveal?() }
-    @objc private func cn() { onCancel?() }
+    @objc private func pr() { onPauseResume?(itemID) }
+    @objc private func pl() { onPlay?(itemID) }
+    @objc private func rv() { onReveal?(itemID) }
+    @objc private func cn() { onCancel?(itemID) }
 
     func configure(_ m: DownloadRowModel) {
         guard m != lastModel else { return }
@@ -171,12 +173,9 @@ final class DownloadsController: NSObject, NSTableViewDataSource, NSTableViewDel
         let old = items
         items = new
         if sameShape {
-            for (i, it) in new.enumerated() where it != old[i] { if let v = table.view(atColumn: 0, row: i, makeIfNecessary: false) as? DownloadRowView { v.configure(DownloadRowModel.make(it)) } }
+            for (i, it) in new.enumerated() where it != old[i] { if let v = table.view(atColumn: 0, row: i, makeIfNecessary: false) as? DownloadRowView { v.itemID = it.id; v.configure(DownloadRowModel.make(it)) } }
         } else { table.reloadData() }
         for (i, it) in new.enumerated() where i < old.count && old[i].id == it.id && old[i].state != it.state { telemetry?("download_state", ["state": "\(it.state)"]) }
-        for it in new where it.state == .completed {                     // a download that finishes now is a new completion even if the same torrent was played before
-            if let o = old.first(where: { $0.id == it.id }), o.state != .completed, handledAutoPlay.remove(it.id) != nil { defaults.set(Array(handledAutoPlay), forKey: "dl.handledAutoPlay") }
-        }
         for it in new where DownloadAutoPlay.shouldStart(it, alreadyHandled: handledAutoPlay, playerBusy: playerBusy()) {
             handledAutoPlay.insert(it.id); defaults.set(Array(handledAutoPlay), forKey: "dl.handledAutoPlay")
             telemetry?("download_autoplay", [:])
@@ -194,39 +193,60 @@ final class DownloadsController: NSObject, NSTableViewDataSource, NSTableViewDel
         let v = (tableView.makeView(withIdentifier: id, owner: nil) as? DownloadRowView) ?? { let r = DownloadRowView(frame: .zero); r.identifier = id; return r }()
         guard row < items.count else { return v }
         let it = items[row]
-        v.configure(DownloadRowModel.make(it))
-        v.onPauseResume = { [weak self] in
-            guard let h = self?.host() else { return }
-            if DownloadRowModel.make(it).canResume { h.resume(it.id) } else { h.pause(it.id) }
-            self?.refresh()
-        }
-        v.onPlay = { [weak self] in self?.onPlay(it) }
-        v.onReveal = { [weak self] in self?.reveal(it) }
-        v.onCancel = { [weak self] in self?.confirmCancel(it) }
+        v.itemID = it.id; v.configure(DownloadRowModel.make(it))
+        // No handler captures a download: each one is given the row's current id and resolves the current state from the latest list when the button is pressed.
+        v.onPauseResume = { [weak self] id in self?.pauseOrResume(id) }
+        v.onPlay = { [weak self] id in self?.play(id) }
+        v.onReveal = { [weak self] id in self?.reveal(id) }
+        v.onCancel = { [weak self] id in self?.confirmCancel(id) }
         return v
     }
 
-    private func reveal(_ it: DownloadItem) {
-        if !it.primaryFile.isEmpty, FileManager.default.fileExists(atPath: it.primaryFile) { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: it.primaryFile)]) }
-        else { NSWorkspace.shared.open(URL(fileURLWithPath: it.savePath)) }
+    private func pauseOrResume(_ id: String) {
+        guard let h = host() else { return }
+        let current = h.list()                                                    // the very latest state, not the last one drawn
+        switch DownloadClick.pauseResume(id: id, in: current) {
+        case .pause(let i): h.pause(i)
+        case .resume(let i): h.resume(i)
+        case .ignore: break
+        }
+        refresh()
+    }
+    private func play(_ id: String) {
+        guard let h = host() else { return }
+        let current = h.list()
+        if DownloadClick.playPath(id: id, in: current) != nil, let it = DownloadClick.item(id, in: current) { onPlay(it) }
+    }
+    private func reveal(_ id: String) {
+        guard let h = host() else { return }
+        let current = h.list()
+        guard let t = DownloadClick.revealTarget(id: id, in: current) else { return }
+        if let f = t.file, FileManager.default.fileExists(atPath: f) { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: f)]) }
+        else { NSWorkspace.shared.open(URL(fileURLWithPath: t.folder)) }
     }
 
     /// Cancelling is deliberate and never deletes anything unless the user says so.
-    private func confirmCancel(_ it: DownloadItem) {
+    private func confirmCancel(_ id: String) {
+        guard let h = host() else { return }
+        let current = h.list()
         let a = NSAlert()
-        if it.state == .completed {
-            a.messageText = "Remove “\(it.name)” from the list?"; a.informativeText = "The downloaded file stays where it is."
-            a.addButton(withTitle: "Remove from List"); a.addButton(withTitle: "Remove and Delete Files"); a.addButton(withTitle: "Keep")
-        } else {
-            a.messageText = "Cancel the download of “\(it.name)”?"; a.informativeText = "\(DownloadFormat.bytes(it.verifiedBytes)) are already downloaded. You can keep that partial data (a later download of the same torrent into the same folder continues from it) or delete it."
+        switch DownloadClick.cancelPrompt(id: id, in: current) {
+        case .gone: return
+        case .completed(let name):
+            a.messageText = "Remove “\(name)” from the list?"; a.informativeText = "The downloaded file stays where it is, unless you choose to delete it. Files that were already in the folder before this download started are never deleted."
+            a.addButton(withTitle: "Remove from List"); a.addButton(withTitle: "Remove and Delete File"); a.addButton(withTitle: "Keep")
+        case .partial(let name, let verified):
+            a.messageText = "Cancel the download of “\(name)”?"
+            a.informativeText = "\(DownloadFormat.bytes(verified)) are already downloaded. You can keep that partial data (a later download of the same torrent into the same folder continues from it) or delete it. Only files this download created are deleted; files that were already in the folder are never touched."
             a.addButton(withTitle: "Cancel and Keep Partial Data"); a.addButton(withTitle: "Cancel and Delete Partial Data"); a.addButton(withTitle: "Continue Downloading")
         }
         a.alertStyle = .informational
         a.beginSheetModal(for: window) { [weak self] r in
             guard let self = self, let h = self.host() else { return }
-            self.handledAutoPlay.remove(it.id); self.defaults.set(Array(self.handledAutoPlay), forKey: "dl.handledAutoPlay")
-            if r == .alertFirstButtonReturn { h.cancel(it.id, deleteFiles: false); self.telemetry?("download_cancelled", ["deleted": false]) }
-            else if r == .alertSecondButtonReturn { h.cancel(it.id, deleteFiles: true); self.telemetry?("download_cancelled", ["deleted": true]) }
+            guard r == .alertFirstButtonReturn || r == .alertSecondButtonReturn else { return }
+            let delete = r == .alertSecondButtonReturn
+            self.handledAutoPlay.remove(id); self.defaults.set(Array(self.handledAutoPlay), forKey: "dl.handledAutoPlay")
+            h.cancel(id, deleteFiles: delete); self.telemetry?("download_cancelled", ["deleted": delete])
             self.refresh()
         }
     }

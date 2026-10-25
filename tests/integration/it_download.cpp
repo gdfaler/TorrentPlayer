@@ -37,16 +37,16 @@ const FileDef kFiles[] = {{"t/a.bin", 3LL * kPiece + 32502}, {"t/v.mp4", 6LL * 1
 constexpr int kVideo = 1;
 
 std::uint64_t mix(std::uint64_t x) { x += 0x9E3779B97F4A7C15ULL; x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL; x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL; return x ^ (x >> 31); }
-void fill(int file, std::int64_t off, std::int64_t len, char* out) {
-  for (std::int64_t i = 0; i < len; ++i) { const std::int64_t p = off + i; out[i] = static_cast<char>(mix(static_cast<std::uint64_t>(file) * 0x1000193ULL + static_cast<std::uint64_t>(p / 8)) >> ((p % 8) * 8)); }
+void fill(int file, std::int64_t off, std::int64_t len, char* out, int salt = 0) {
+  for (std::int64_t i = 0; i < len; ++i) { const std::int64_t p = off + i; out[i] = static_cast<char>(mix(static_cast<std::uint64_t>(file) * 0x1000193ULL + static_cast<std::uint64_t>(salt) * 0x9E3779B1ULL + static_cast<std::uint64_t>(p / 8)) >> ((p % 8) * 8)); }
 }
-bool file_matches(const fs::path& p, int file) {
+bool file_matches(const fs::path& p, int file, int salt = 0) {
   std::ifstream f(p, std::ios::binary); if (!f) return false;
   std::vector<char> got(1 << 20), want(1 << 20);
   for (std::int64_t off = 0; off < kFiles[file].size; off += static_cast<std::int64_t>(got.size())) {
     const auto n = std::min<std::int64_t>(static_cast<std::int64_t>(got.size()), kFiles[file].size - off);
     f.read(got.data(), n); if (f.gcount() != n) return false;
-    fill(file, off, n, want.data()); if (std::memcmp(got.data(), want.data(), static_cast<std::size_t>(n)) != 0) return false;
+    fill(file, off, n, want.data(), salt); if (std::memcmp(got.data(), want.data(), static_cast<std::size_t>(n)) != 0) return false;
   }
   return true;
 }
@@ -61,12 +61,12 @@ struct Content {
   fs::path root;                       // contains t/
   std::vector<char> torrent;
   std::string hex;
-  static Content make(const fs::path& base) {
-    Content c; c.root = base / "seed_content"; fs::create_directories(c.root / "t");
+  static Content make(const fs::path& base, int salt = 0, const char* dir = "seed_content") {
+    Content c; c.root = base / dir; fs::create_directories(c.root / "t");
     lt::file_storage fsr;
     for (int i = 0; i < 3; ++i) {
       std::ofstream o(c.root / kFiles[i].path, std::ios::binary | std::ios::trunc); std::vector<char> b(1 << 20);
-      for (std::int64_t off = 0; off < kFiles[i].size; off += static_cast<std::int64_t>(b.size())) { const auto n = std::min<std::int64_t>(b.size(), kFiles[i].size - off); fill(i, off, n, b.data()); o.write(b.data(), n); }
+      for (std::int64_t off = 0; off < kFiles[i].size; off += static_cast<std::int64_t>(b.size())) { const auto n = std::min<std::int64_t>(b.size(), kFiles[i].size - off); fill(i, off, n, b.data(), salt); o.write(b.data(), n); }
       fsr.add_file(kFiles[i].path, kFiles[i].size);
     }
     lt::create_torrent ct(fsr, kPiece, lt::create_flags_t{} | lt::create_torrent::v1_only);
@@ -258,8 +258,8 @@ static void sc_cancel() {
     tp::DownloadManager m(make_cfg(root / "state2", next_port()));        // adding it again picks up the kept data instead of starting from zero
     const auto id = m.add(make_req(*g_content, dest, {kVideo}, seed.ep()));
     TP_CHECK(wait_state(m, id, tp::DlState::Completed, 60)); TP_CHECK(file_matches(file_of(dest, kVideo), kVideo));
-    TP_CHECK(m.cancel(id, true));                                         // explicit deletion of a completed download
-    TP_CHECK(!fs::exists(file_of(dest, kVideo)));
+    TP_CHECK(m.cancel(id, true));                                         // "delete" on data that was already in the folder when this download started (the partial data kept above): left alone
+    TP_CHECK(fs::exists(file_of(dest, kVideo)));
   }
 }
 static void sc_destination_errors() {
@@ -349,6 +349,90 @@ static void sc_no_background_ui_needed() {                                // tra
   TP_CHECK(wait_state(m, id, tp::DlState::Completed, 60));
 }
 
+// ---------------------------------------------------------------- completed downloads across restarts, and what "delete" may touch
+static void complete_then_close(const fs::path& state, const fs::path& dest, const Seeder& seed, std::string* id) {
+  tp::DownloadManager a(make_cfg(state, next_port()));
+  *id = a.add(make_req(*g_content, dest, {kVideo}, seed.ep()));
+  TP_CHECK(wait_state(a, *id, tp::DlState::Completed, 60));
+}
+static void flip_byte(const fs::path& p, std::int64_t at) { std::fstream f(p, std::ios::in | std::ios::out | std::ios::binary); f.seekg(at); char c = 0; f.read(&c, 1); c = static_cast<char>(c ^ 0x5A); f.seekp(at); f.write(&c, 1); }
+static void sc_completed_modified_between_sessions() {   // same size, different bytes: must never be reported (or auto-played) as a verified completed file
+  const auto root = fresh(g_base, "cmod"); Seeder seed(*g_content, next_port(), 0); const auto state = root / "state", dest = root / "dest"; std::string id;
+  complete_then_close(state, dest, seed, &id); if (id.empty()) return;
+  std::this_thread::sleep_for(std::chrono::seconds(2)); flip_byte(file_of(dest, kVideo), 3 * 1024 * 1024 + 11);
+  TP_CHECK(!file_matches(file_of(dest, kVideo), kVideo));
+  tp::DownloadManager b(make_cfg(state, next_port())); TP_CHECK_EQ(b.restore(), 1);
+  bool false_completed = false;
+  for (int i = 0; i < 400 && !st(b, id).completed; ++i) {               // watch the whole repair: "Completed" may only ever be shown for correct bytes
+    const auto s = st(b, id); if (s.state == tp::DlState::Completed && !file_matches(file_of(dest, kVideo), kVideo)) false_completed = true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (i == 0) TP_CHECK(s.state != tp::DlState::Completed);          // not trusted right after the restart
+  }
+  TP_CHECK(!false_completed); TP_CHECK(wait_state(b, id, tp::DlState::Completed, 60)); TP_CHECK(file_matches(file_of(dest, kVideo), kVideo));      // repaired from the source
+}
+static void sc_completed_modified_no_source() {
+  const auto root = fresh(g_base, "cmod2"); std::string id; const auto state = root / "state", dest = root / "dest";
+  { Seeder seed(*g_content, next_port(), 0); complete_then_close(state, dest, seed, &id); }
+  if (id.empty()) return;
+  std::this_thread::sleep_for(std::chrono::seconds(2)); flip_byte(file_of(dest, kVideo), 1234567);
+  tp::DownloadManager b(make_cfg(state, next_port())); TP_CHECK_EQ(b.restore(), 1);
+  for (int i = 0; i < 80; ++i) { TP_CHECK(st(b, id).state != tp::DlState::Completed); std::this_thread::sleep_for(std::chrono::milliseconds(100)); }   // 8 s, nothing to repair it with
+  TP_CHECK(!st(b, id).completed); TP_CHECK(!st(b, id).primary_file.empty());
+}
+static void sc_completed_unchanged_restart() {            // ordinary fast path: unchanged data is trusted at once and nothing is transferred
+  const auto root = fresh(g_base, "cok"); Seeder seed(*g_content, next_port(), 0); const auto state = root / "state", dest = root / "dest"; std::string id;
+  complete_then_close(state, dest, seed, &id); if (id.empty()) return;
+  const auto up = seed.uploaded();
+  tp::DownloadManager b(make_cfg(state, next_port())); TP_CHECK_EQ(b.restore(), 1);
+  TP_CHECK(st(b, id).state == tp::DlState::Completed); TP_CHECK(st(b, id).completed); TP_CHECK_EQ(b.live_torrents(), 0);
+  std::this_thread::sleep_for(std::chrono::seconds(1)); TP_CHECK_EQ(seed.uploaded(), up);
+}
+static void sc_completed_touched_not_redownloaded() {     // only the modification time changed: re-checked against the piece hashes, no data fetched again
+  const auto root = fresh(g_base, "ctouch"); Seeder seed(*g_content, next_port(), 0); const auto state = root / "state", dest = root / "dest"; std::string id;
+  complete_then_close(state, dest, seed, &id); if (id.empty()) return;
+  std::this_thread::sleep_for(std::chrono::seconds(2)); fs::last_write_time(file_of(dest, kVideo), fs::file_time_type::clock::now());
+  const auto up = seed.uploaded();
+  tp::DownloadManager b(make_cfg(state, next_port())); TP_CHECK_EQ(b.restore(), 1);
+  TP_CHECK(st(b, id).state != tp::DlState::Completed);
+  TP_CHECK(wait_state(b, id, tp::DlState::Completed, 30)); TP_CHECK(file_matches(file_of(dest, kVideo), kVideo));
+  TP_CHECK_EQ(seed.uploaded(), up);
+}
+static void sc_cancel_delete_scope() {                     // "delete" removes this download's own files only
+  const auto root = fresh(g_base, "delscope"); Seeder seed(*g_content, next_port(), kSlow); const auto dest = root / "dest";
+  fs::create_directories(dest / "t"); { std::ofstream(dest / "notes.txt") << "mine"; std::ofstream(dest / "t" / "notes.txt") << "mine too"; }
+  {
+    tp::DownloadManager m(make_cfg(root / "state", next_port())); const auto id = m.add(make_req(*g_content, dest, {kVideo}, seed.ep()));
+    TP_CHECK(wait_for(30, [&] { return st(m, id).verified_bytes >= kFiles[kVideo].size / 3; }));
+    TP_CHECK(m.cancel(id, true));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  TP_CHECK(fs::exists(dest / "notes.txt")); TP_CHECK(fs::exists(dest / "t" / "notes.txt")); TP_CHECK(fs::is_directory(dest));          // unrelated files and the folder itself stay
+  TP_CHECK(!fs::exists(file_of(dest, kVideo))); TP_CHECK(!fs::exists(file_of(dest, 0)));                                              // the download's own files (and its boundary file) are gone
+  // a file that was already in the folder before the download started is never deleted
+  const auto dest2 = root / "dest2"; fs::create_directories(dest2 / "t"); fs::copy_file(g_content->root / kFiles[0].path, file_of(dest2, 0));
+  {
+    tp::DownloadManager m(make_cfg(root / "state2", next_port())); const auto id = m.add(make_req(*g_content, dest2, {kVideo}, seed.ep()));
+    TP_CHECK(wait_for(30, [&] { return st(m, id).verified_bytes >= kFiles[kVideo].size / 3; })); TP_CHECK(m.cancel(id, true));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  TP_CHECK(file_matches(file_of(dest2, 0), 0));
+}
+static void sc_overlapping_destinations() {               // two different torrents that use the same file paths
+  const auto root = fresh(g_base, "overlap"); static const Content other = Content::make(g_base, 7, "seed_content2");
+  Seeder s1(*g_content, next_port(), 0); Seeder s2(other, next_port(), 0); const auto dest = root / "dest";
+  tp::DownloadManager m(make_cfg(root / "state", next_port())); std::string err;
+  auto r1 = make_req(*g_content, dest, {kVideo}, s1.ep());
+  const auto a = m.add(r1); TP_CHECK(!a.empty());
+  tp::DownloadRequest r2; r2.torrent_bytes = other.torrent; r2.save_path = dest; r2.files = {kVideo}; r2.extra_peers = {s2.ep()}; r2.strip_trackers = true;
+  TP_CHECK(m.add(r2, &err).empty()); TP_CHECK(err.find("already used by another download") != std::string::npos); LOG("overlap refused: %s", err.c_str());
+  TP_CHECK(wait_state(m, a, tp::DlState::Completed, 60)); TP_CHECK(file_matches(file_of(dest, kVideo), kVideo));
+  // B selects another file of the same layout, but its boundary data would be written into v.mp4, which A owns: refused as well, A's file stays intact
+  tp::DownloadRequest r3 = r2; r3.files = {2};
+  TP_CHECK(m.add(r3, &err).empty()); TP_CHECK(err.find("already used by another download") != std::string::npos);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500)); TP_CHECK(file_matches(file_of(dest, kVideo), kVideo));
+  TP_CHECK(m.cancel(a, true)); TP_CHECK(!fs::exists(file_of(dest, kVideo)));           // deleting a completed download removes the files it created
+}
+
 int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
   g_base = fs::path(TP_BUILD_DIR) / "it_download_run"; fs::create_directories(g_base);
@@ -358,7 +442,10 @@ int main(int argc, char** argv) {
                     {"resume_new_session", sc_resume_new_session}, {"resume_missing", sc_resume_missing}, {"resume_garbage", sc_resume_garbage}, {"resume_modified", sc_resume_modified},
                     {"cancel", sc_cancel}, {"destination_errors", sc_destination_errors}, {"network_loss_and_restore", sc_network_loss_and_restore}, {"rapid_flaps", sc_rapid_flaps},
                     {"pause_survives_network_change", sc_pause_survives_network_change}, {"no_sources_then_sources", sc_no_sources_then_sources},
-                    {"auto_resume_disabled", sc_auto_resume_disabled}, {"no_background_ui_needed", sc_no_background_ui_needed}};
+                    {"auto_resume_disabled", sc_auto_resume_disabled}, {"no_background_ui_needed", sc_no_background_ui_needed},
+                    {"completed_modified_between_sessions", sc_completed_modified_between_sessions}, {"completed_modified_no_source", sc_completed_modified_no_source},
+                    {"completed_unchanged_restart", sc_completed_unchanged_restart}, {"completed_touched_not_redownloaded", sc_completed_touched_not_redownloaded},
+                    {"cancel_delete_scope", sc_cancel_delete_scope}, {"overlapping_destinations", sc_overlapping_destinations}};
   int ran = 0;
   for (auto& s : all) {
     bool want = argc <= 1; for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == s.name) want = true;

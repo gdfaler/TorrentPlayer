@@ -52,7 +52,7 @@ jobs:
       - name: Build and run the unit tests
         run: tools/scripts/ci_core_unit_tests.sh ci_build
       - name: Download & Play core tests (loopback subset)
-        run: tools/scripts/run_download_tests.sh ci_build selected_file whole_torrent magnet resume_new_session resume_missing cancel destination_errors network_loss_and_restore
+        run: tools/scripts/run_download_tests.sh ci_build selected_file whole_torrent magnet resume_new_session resume_missing cancel destination_errors network_loss_and_restore completed_modified_between_sessions completed_unchanged_restart cancel_delete_scope overlapping_destinations
 
   swift-unit-tests:
     name: Swift unit tests (macOS arm64)

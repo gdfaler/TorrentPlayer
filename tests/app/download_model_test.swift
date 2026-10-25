@@ -56,6 +56,26 @@ func item(_ s: DownloadState, verified: Int64 = 0, total: Int64 = 1_000_000, rat
         check(!def.downloadMode && !def.wholeTorrent && def.autoPlay && def.autoResumeOnNetwork && def.destination == "/Users/x/Movies/TorrentPlayer", "defaults: Stream mode, resume on network enabled")
         var p = def; p.downloadMode = true; p.wholeTorrent = true; p.destination = "/Volumes/Big/Films"; p.autoPlay = false; p.autoResumeOnNetwork = false; p.save(suite)
         check(DownloadPreferences.load(suite, home: "/Users/x") == p, "preferences round trip")
+        // clicks resolve the CURRENT download at click time (a row whose state changed since it was built must not act on its old state)
+        var a1 = item(.downloading, verified: 100_000, rate: 1000); a1.id = "a"; var b1 = item(.paused, verified: 200_000); b1.id = "b"
+        check(DownloadClick.pauseResume(id: "a", in: [a1, b1]) == .pause("a"), "downloading -> pause")
+        var a2 = a1; a2.state = .paused
+        check(DownloadClick.pauseResume(id: "a", in: [a2, b1]) == .resume("a"), "after the pause the same row means resume (stale handler would pause again)")
+        var a3 = a1; a3.state = .waitingNetwork
+        check(DownloadClick.pauseResume(id: "a", in: [a3]) == .pause("a"), "waiting for network can still be paused by the user")
+        var a4 = a1; a4.state = .failed; a4.error = "x"
+        check(DownloadClick.pauseResume(id: "a", in: [a4]) == .resume("a"), "failed -> retry")
+        var a5 = a1; a5.state = .completed; a5.verifiedBytes = a5.selectedBytes
+        check(DownloadClick.pauseResume(id: "a", in: [a5]) == .ignore, "completed: nothing to pause or resume")
+        check(DownloadClick.pauseResume(id: "a", in: [b1]) == .ignore, "removed download: ignored")
+        check(DownloadClick.pauseResume(id: "b", in: [b1, a1]) == .resume("b"), "row reuse / reordering: the id decides, not the position")
+        check(DownloadClick.playPath(id: "a", in: [a1]) == nil, "no play while downloading")
+        check(DownloadClick.playPath(id: "a", in: [a5]) == a5.primaryFile, "play once completed")
+        check(DownloadClick.playPath(id: "zz", in: [a5]) == nil, "play of a removed download")
+        check(DownloadClick.revealTarget(id: "a", in: [a1])?.folder == a1.savePath && DownloadClick.revealTarget(id: "zz", in: [a1]) == nil, "reveal target")
+        check(DownloadClick.cancelPrompt(id: "a", in: [a1]) == .partial(name: "Movie.mkv", verified: 100_000), "cancel of a running download offers keep/delete of partial data")
+        check(DownloadClick.cancelPrompt(id: "a", in: [a5]) == .completed(name: "Movie.mkv"), "cancel of a finished download is a removal")
+        check(DownloadClick.cancelPrompt(id: "a", in: []) == .gone, "cancel of a vanished download")
         print("download_model_test: \(checks) checks, \(failures) failures")
         exit(failures == 0 ? 0 : 1)
     }
