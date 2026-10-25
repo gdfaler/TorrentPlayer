@@ -8,6 +8,9 @@
 #include <libtorrent/session.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/torrent_info.hpp>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <atomic>
@@ -61,7 +64,7 @@ struct Content {
   fs::path root;                       // contains t/
   std::vector<char> torrent;
   std::string hex;
-  static Content make(const fs::path& base, int salt = 0, const char* dir = "seed_content") {
+  static Content make(const fs::path& base, int salt = 0, const char* dir = "seed_content", const std::string& tracker = "", const std::string& web_seed = "") {
     Content c; c.root = base / dir; fs::create_directories(c.root / "t");
     lt::file_storage fsr;
     for (int i = 0; i < 3; ++i) {
@@ -70,6 +73,8 @@ struct Content {
       fsr.add_file(kFiles[i].path, kFiles[i].size);
     }
     lt::create_torrent ct(fsr, kPiece, lt::create_flags_t{} | lt::create_torrent::v1_only);
+    if (!tracker.empty()) ct.add_tracker(tracker);
+    if (!web_seed.empty()) ct.add_url_seed(web_seed);
     lt::set_piece_hashes(ct, c.root.string());
     lt::bencode(std::back_inserter(c.torrent), ct.generate());
     lt::torrent_info ti(c.torrent.data(), static_cast<int>(c.torrent.size()));
@@ -433,6 +438,83 @@ static void sc_overlapping_destinations() {               // two different torre
   TP_CHECK(m.cancel(a, true)); TP_CHECK(!fs::exists(file_of(dest, kVideo)));           // deleting a completed download removes the files it created
 }
 
+// ---------------------------------------------------------------- production source discovery (no extra_peers): a tracker, and a web seed that sends no "Server" header
+struct Tracker {                                           // HTTP tracker on loopback: answers every announce with one compact peer
+  int fd = -1; int port; std::string peer_ip; int peer_port; std::atomic<bool> stop{false}; std::atomic<int> announces{0}; std::thread th; std::vector<std::thread> conns;
+  Tracker(int p, const std::string& ip, int pp) : port(p), peer_ip(ip), peer_port(pp) {
+    fd = ::socket(AF_INET, SOCK_STREAM, 0); int one = 1; ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(static_cast<uint16_t>(port)); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0 || ::listen(fd, 16) != 0) { std::perror("tracker bind/listen"); std::exit(2); }
+    th = std::thread([this] { while (!stop) { int c = ::accept(fd, nullptr, nullptr); if (c < 0) break; conns.emplace_back([this, c] { serve(c); }); } });
+  }
+  ~Tracker() { stop = true; ::shutdown(fd, SHUT_RDWR); ::close(fd); if (th.joinable()) th.join(); for (auto& t : conns) if (t.joinable()) t.join(); }
+  void serve(int c) {
+    char buf[4096]; std::string req; while (req.find("\r\n\r\n") == std::string::npos) { ssize_t n = ::recv(c, buf, sizeof buf, 0); if (n <= 0) { ::close(c); return; } req.append(buf, static_cast<size_t>(n)); }
+    ++announces;
+    std::string peers(6, '\0'); in_addr ia{}; ::inet_pton(AF_INET, peer_ip.c_str(), &ia); std::memcpy(&peers[0], &ia, 4); peers[4] = static_cast<char>(peer_port >> 8); peers[5] = static_cast<char>(peer_port & 255);
+    std::string body = "d8:completei1e10:incompletei0e8:intervali30e12:min intervali10e5:peers6:" + peers + "e";
+    std::string resp = "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    ::send(c, resp.data(), resp.size(), 0); ::close(c);
+  }
+};
+struct WebSeedServer {                                     // plain HTTP file server with Range support and, like many real servers, no "Server" header
+  int fd = -1; int port; fs::path root; int first_delay_ms; std::atomic<bool> stop{false}; std::atomic<int> requests{0}; std::thread th; std::vector<std::thread> conns;
+  WebSeedServer(int p, fs::path r, int first_response_delay_ms = 0) : port(p), root(std::move(r)), first_delay_ms(first_response_delay_ms) {
+    fd = ::socket(AF_INET, SOCK_STREAM, 0); int one = 1; ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(static_cast<uint16_t>(port)); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0 || ::listen(fd, 16) != 0) { std::perror("web bind/listen"); std::exit(2); }
+    th = std::thread([this] { while (!stop) { int c = ::accept(fd, nullptr, nullptr); if (c < 0) break; conns.emplace_back([this, c] { serve(c); }); } });
+  }
+  ~WebSeedServer() { stop = true; ::shutdown(fd, SHUT_RDWR); ::close(fd); if (th.joinable()) th.join(); for (auto& t : conns) if (t.joinable()) t.join(); }
+  void serve(int c) {
+    std::string buf; char tmp[4096];
+    for (;;) {
+      while (buf.find("\r\n\r\n") == std::string::npos) { ssize_t n = ::recv(c, tmp, sizeof tmp, 0); if (n <= 0 || stop) { ::close(c); return; } buf.append(tmp, static_cast<size_t>(n)); }
+      const auto e = buf.find("\r\n\r\n"); const std::string head = buf.substr(0, e); buf.erase(0, e + 4);
+      char path[512] = {0}; std::sscanf(head.c_str(), "GET %511s", path);
+      if (requests.fetch_add(1) == 0 && first_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(first_delay_ms));      // the server is connected but silent for a while
+      long long a = 0, b = -1; const auto rp = head.find("Range: bytes="); if (rp != std::string::npos) std::sscanf(head.c_str() + rp, "Range: bytes=%lld-%lld", &a, &b);
+      std::ifstream f(root / (path + 1), std::ios::binary); if (!f) { const char* nf = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"; ::send(c, nf, strlen(nf), 0); continue; }
+      f.seekg(0, std::ios::end); const long long size = f.tellg(); if (b < 0 || b >= size) b = size - 1;
+      char hdr[300]; std::snprintf(hdr, sizeof hdr, "HTTP/1.1 206 Partial Content\r\nContent-Length: %lld\r\nContent-Range: bytes %lld-%lld/%lld\r\n\r\n", b - a + 1, a, b, size);
+      ::send(c, hdr, strlen(hdr), 0); f.seekg(a); std::vector<char> chunk(16384);
+      for (long long left = b - a + 1; left > 0;) { const auto n = std::min<long long>(left, static_cast<long long>(chunk.size())); f.read(chunk.data(), n); if (::send(c, chunk.data(), static_cast<size_t>(n), 0) <= 0) { ::close(c); return; } left -= n; std::this_thread::sleep_for(std::chrono::milliseconds(20)); }
+    }
+  }
+};
+static void sc_tracker_discovery() {                       // the torrent's own tracker is the only way to find the peer: announce -> peer list -> connection -> verified download
+  const auto root = fresh(g_base, "tracker"); const int tport = next_port(), sport = next_port();
+  const Content tc = Content::make(g_base, 0, "seed_content_tracker", "http://127.0.0.1:" + std::to_string(tport) + "/announce");
+  Seeder seed(tc, sport, 0); Tracker trk(tport, "127.0.0.1", sport);
+  tp::DownloadManager m(make_cfg(root / "state", next_port())); const auto dest = root / "dest";
+  tp::DownloadRequest r; r.torrent_bytes = tc.torrent; r.save_path = dest; r.files = {kVideo};      // no extra_peers, trackers kept
+  const auto id = m.add(r); TP_CHECK(!id.empty()); if (id.empty()) return;
+  TP_CHECK(wait_state(m, id, tp::DlState::Completed, 60)); TP_CHECK(file_matches(file_of(dest, kVideo), kVideo));
+  TP_CHECK(trk.announces.load() >= 1); LOG("tracker saw %d announce(s)", trk.announces.load());
+}
+static void sc_web_seed_counts_as_source() {               // a connected web seed (here silent for 4 s, and sending no "Server" header) is a source: counted, and never shown as "Waiting for sources" while it is connected or data flows
+  const auto root = fresh(g_base, "webseed_src"); const int wport = next_port();
+  const Content wc = Content::make(g_base, 0, "seed_content_web", "", "http://127.0.0.1:" + std::to_string(wport) + "/");
+  WebSeedServer web(wport, wc.root, 4000);
+  tp::DownloadManager m(make_cfg(root / "state", next_port())); const auto dest = root / "dest";
+  tp::DownloadRequest r; r.torrent_bytes = wc.torrent; r.save_path = dest; r.files = {kVideo}; r.strip_trackers = true;
+  const auto id = m.add(r); TP_CHECK(!id.empty()); if (id.empty()) return;
+  bool saw_sources = false, waiting_while_data_flows = false, saw_progress = false, silent_connected_seen = false, silent_connected_mislabelled = false;
+  const auto t = Clock::now();
+  while (secs_since(t) < 60) {
+    const auto s = st(m, id);
+    if (s.web_seeds >= 1) saw_sources = true;
+    if (web.requests.load() >= 1 && s.verified_bytes == 0 && !s.completed) {     // the web seed has been asked and has not answered yet: it is connected, and a connected source must be counted and not shown as "Waiting for sources"
+      silent_connected_seen = true; if (s.web_seeds < 1 || s.state == tp::DlState::WaitingForSources) silent_connected_mislabelled = true;
+    }
+    if (s.verified_bytes > 0) saw_progress = true;
+    if (s.state == tp::DlState::WaitingForSources && (s.download_rate > 0 || s.verified_bytes > 0 || s.web_seeds > 0)) waiting_while_data_flows = true;
+    if (s.completed) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  TP_CHECK(saw_sources); TP_CHECK(saw_progress); TP_CHECK(!waiting_while_data_flows); TP_CHECK(silent_connected_seen); TP_CHECK(!silent_connected_mislabelled); TP_CHECK(st(m, id).completed); TP_CHECK(file_matches(file_of(dest, kVideo), kVideo));
+}
+
 int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
   g_base = fs::path(TP_BUILD_DIR) / "it_download_run"; fs::create_directories(g_base);
@@ -445,7 +527,8 @@ int main(int argc, char** argv) {
                     {"auto_resume_disabled", sc_auto_resume_disabled}, {"no_background_ui_needed", sc_no_background_ui_needed},
                     {"completed_modified_between_sessions", sc_completed_modified_between_sessions}, {"completed_modified_no_source", sc_completed_modified_no_source},
                     {"completed_unchanged_restart", sc_completed_unchanged_restart}, {"completed_touched_not_redownloaded", sc_completed_touched_not_redownloaded},
-                    {"cancel_delete_scope", sc_cancel_delete_scope}, {"overlapping_destinations", sc_overlapping_destinations}};
+                    {"cancel_delete_scope", sc_cancel_delete_scope}, {"overlapping_destinations", sc_overlapping_destinations},
+                    {"tracker_discovery", sc_tracker_discovery}, {"web_seed_counts_as_source", sc_web_seed_counts_as_source}};
   int ran = 0;
   for (auto& s : all) {
     bool want = argc <= 1; for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == s.name) want = true;

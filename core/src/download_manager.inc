@@ -101,7 +101,10 @@ DownloadManager::DownloadManager(DownloadConfig cfg) : cfg_(std::move(cfg)) {
     sp.set_int(lt::settings_pack::out_enc_policy, lt::settings_pack::pe_disabled);
     sp.set_int(lt::settings_pack::in_enc_policy, lt::settings_pack::pe_disabled);
   }
-  sp.set_int(lt::settings_pack::alert_mask, lt::alert_category::error | lt::alert_category::status | lt::alert_category::storage);
+  lt::alert_category_t mask = lt::alert_category::error | lt::alert_category::status | lt::alert_category::storage;
+  // DIAGNOSTICS ONLY (default off): TP_DL_DIAG=<file> records tracker, DHT, peer and connection alerts. It adds alert categories and a log file; no behaviour changes.
+  if (const char* f = std::getenv("TP_DL_DIAG")) { if (*f) { diag_.open(f, std::ios::app); mask |= lt::alert_category::tracker | lt::alert_category::dht | lt::alert_category::peer | lt::alert_category::connect; } }
+  sp.set_int(lt::settings_pack::alert_mask, mask);
   ses_ = std::make_unique<lt::session>(lt::session_params(sp));
   th_ = std::thread([this] { alert_loop(); });
 }
@@ -324,13 +327,21 @@ void DownloadManager::fill_status(Entry& e, DownloadStatus* o) {
   o->download_rate = s.download_payload_rate; o->upload_rate = s.upload_payload_rate;
   std::vector<lt::peer_info> pi; e.h.get_peer_info(pi);
   for (auto const& p : pi) {
-    if (p.flags & (lt::peer_info::connecting | lt::peer_info::handshake)) continue;       // a connection attempt is not a source
-    if (p.connection_type == lt::peer_info::web_seed) ++o->web_seeds; else ++o->peers;
+    if (p.flags & lt::peer_info::connecting) { ++o->connecting; continue; }               // a connection attempt is not a source
+    if (p.connection_type == lt::peer_info::web_seed) { ++o->web_seeds; continue; }       // web seeds never do a BitTorrent handshake: libtorrent keeps the "handshake" flag on them until the server names itself
+    if (p.flags & lt::peer_info::handshake) { ++o->connecting; continue; }
+    ++o->peers;
+  }
+  for (auto const& t : e.h.trackers()) {
+    ++o->trackers_total;
+    bool ok = false, bad = false;
+    for (auto const& ep : t.endpoints) for (auto const& ih : ep.info_hashes) { if (ih.fails > 0) bad = true; else if (ih.start_sent && !ih.updating) ok = true; }
+    if (bad) ++o->trackers_failing; else if (ok) ++o->trackers_ok;
   }
   o->checking_progress = s.progress;
   if (e.failed) return;
   const bool checking = s.state == lt::torrent_status::checking_files || s.state == lt::torrent_status::checking_resume_data;
-  const bool connected = (o->peers + o->web_seeds) > 0;
+  const bool connected = (o->peers + o->web_seeds) > 0 || o->download_rate > 0;       // bytes arriving prove a source even if its connection is not listed as established
   if (e.user_paused) o->state = DlState::PausedByUser;
   else if (checking) o->state = DlState::Checking;
   else if (!online_.load() || e.net_paused) o->state = DlState::WaitingForNetwork;
@@ -440,6 +451,10 @@ void DownloadManager::save_all() {
 }
 
 void DownloadManager::handle_alert(lt::alert* a) {
+  if (diag_.is_open() && (a->category() & (lt::alert_category::tracker | lt::alert_category::dht | lt::alert_category::peer | lt::alert_category::connect | lt::alert_category::error))) {
+    char t[32]; std::snprintf(t, sizeof t, "[%8.2f] ", std::chrono::duration<double>(std::chrono::steady_clock::now() - diag_t0_).count());
+    diag_ << t << a->what() << ": " << a->message() << "\n"; diag_.flush();
+  }
   if (auto* r = lt::alert_cast<lt::save_resume_data_alert>(a)) {
     const std::string id = hex20(r->handle.info_hashes().get_best());
     auto buf = lt::write_resume_data_buf(r->params);

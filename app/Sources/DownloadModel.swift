@@ -23,6 +23,7 @@ struct DownloadItem: Equatable {
     var userPaused = false
     var autoPlay = true
     var checkingProgress = 0.0
+    var trackersTotal = 0, trackersOK = 0, trackersFailing = 0, connecting = 0
     var completed: Bool { state == .completed }
     /// Verified fraction, never above 1 and never a rounded-up 100% before the download is really complete.
     var fraction: Double {
@@ -33,6 +34,14 @@ struct DownloadItem: Equatable {
 }
 
 enum DownloadFormat {
+    /// What peer discovery has achieved so far, from facts only ("0 of 10 trackers answered, 10 failing").
+    static func discovery(_ d: DownloadItem) -> String {
+        if d.trackersTotal == 0 { return "This torrent lists no trackers; only DHT and local discovery can find peers." }
+        var s = "\(d.trackersOK) of \(d.trackersTotal) trackers answered"
+        if d.trackersFailing > 0 { s += ", \(d.trackersFailing) failing" }
+        if d.connecting > 0 { s += "; \(d.connecting) connection attempt\(d.connecting == 1 ? "" : "s") in progress" }
+        return s + "."
+    }
     static func bytes(_ n: Int64) -> String { ByteCountFormatter.string(fromByteCount: max(0, n), countStyle: .file) }
     static func percent(_ f: Double) -> String { "\(Int((min(max(f, 0), 0.9999) * 100).rounded(.down)))%" }
     /// "about 5 min left"; nil when there is no meaningful estimate.
@@ -73,7 +82,7 @@ struct DownloadRowModel: Equatable {
         case .waitingNetwork:
             detail = "Waiting for network · \(DownloadFormat.percent(d.fraction)) · \(amount). It continues by itself when the connection returns."
         case .waitingSources:
-            detail = "Waiting for sources · \(DownloadFormat.percent(d.fraction)) · \(amount). No peer or web seed is connected right now; TorrentPlayer keeps looking."
+            detail = "Waiting for sources · \(DownloadFormat.percent(d.fraction)) · \(amount). No peer or web seed is connected; TorrentPlayer keeps looking. " + DownloadFormat.discovery(d)
         case .paused:
             detail = "Paused · \(DownloadFormat.percent(d.fraction)) · \(amount)"
         case .resuming:
@@ -113,6 +122,45 @@ enum DownloadClick {
         guard let d = item(id, in: items) else { return .gone }
         return d.state == .completed ? .completed(name: d.name) : .partial(name: d.name, verified: d.verifiedBytes)
     }
+}
+
+/// What the operating system tells us about the network, kept apart from what the downloader can reach. A usable path is NOT proof that the internet or any
+/// torrent source is reachable (a VPN or tunnel interface stays up when Wi-Fi is switched off, and UDP or BitTorrent traffic may be blocked on a working path).
+struct NetworkPathSummary: Equatable {
+    enum Status: Equatable { case unknown, unavailable, available }
+    var status = Status.unknown
+    var physical: [String] = []             // "Wi-Fi", "Ethernet", "Cellular" interfaces that are available
+    var tunnels = 0                         // VPN / tunnel / other interfaces
+    var expensive = false, constrained = false
+
+    /// What the downloader is told: nil while unknown, false without a path or when only tunnels exist (a tunnel needs a real network underneath), otherwise true.
+    var downloaderOnline: Bool? {
+        switch status {
+        case .unknown: return nil
+        case .unavailable: return false
+        case .available: return !physical.isEmpty
+        }
+    }
+    var headline: String {
+        switch status {
+        case .unknown: return "Checking the network…"
+        case .unavailable: return "No network connection."
+        case .available:
+            if physical.isEmpty { return "No real network connection: only a VPN or tunnel interface is active." }
+            return "Network connection present (" + physical.joined(separator: ", ") + (tunnels > 0 ? ", with a VPN or tunnel" : "") + ")."
+        }
+    }
+    var detail: String {
+        switch status {
+        case .unknown: return "Waiting for the system to report the connection."
+        case .unavailable, .available where physical.isEmpty: return "Downloads wait and continue by themselves when a connection returns."
+        case .available:
+            var s = "This only says an interface is up; it does not prove the internet or any torrent source can be reached."
+            if constrained { s += " The connection is marked constrained (Low Data Mode)." } else if expensive { s += " The connection is marked expensive." }
+            return s + " Downloads continue anyway."
+        }
+    }
+    var text: String { headline + " " + detail }
 }
 
 enum DownloadAutoPlay {

@@ -293,6 +293,7 @@ static void fill_dl(const tp::DownloadStatus& s, tp_dl_status* o) {
   o->state = static_cast<int>(s.state); o->selected_bytes = s.selected_bytes; o->verified_bytes = s.verified_bytes; o->progress = s.progress;
   o->download_rate = s.download_rate; o->upload_rate = s.upload_rate; o->peers = s.peers; o->web_seeds = s.web_seeds; o->eta_s = s.eta_s;
   o->user_paused = s.user_paused; o->network_available = s.network_available; o->auto_play = s.auto_play; o->completed = s.completed; o->checking_progress = s.checking_progress;
+  o->trackers_total = s.trackers_total; o->trackers_ok = s.trackers_ok; o->trackers_failing = s.trackers_failing; o->connecting = s.connecting;
 }
 extern "C" {
 tp_dlmgr* tp_dl_create(const tp_dl_config* cfg, char* err, size_t errlen) {

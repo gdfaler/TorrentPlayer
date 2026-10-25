@@ -46,7 +46,8 @@ final class TPDownloads {
             DownloadItem(id: cstr(s.id), name: cstr(s.name), savePath: cstr(s.save_path), primaryFile: cstr(s.primary_file), error: cstr(s.error),
                          state: DownloadState(rawValue: Int(s.state)) ?? .failed, selectedBytes: s.selected_bytes, verifiedBytes: s.verified_bytes,
                          downloadRate: Int(s.download_rate), uploadRate: Int(s.upload_rate), peers: Int(s.peers), webSeeds: Int(s.web_seeds), etaSeconds: s.eta_s,
-                         userPaused: s.user_paused != 0, autoPlay: s.auto_play != 0, checkingProgress: s.checking_progress)
+                         userPaused: s.user_paused != 0, autoPlay: s.auto_play != 0, checkingProgress: s.checking_progress,
+                         trackersTotal: Int(s.trackers_total), trackersOK: Int(s.trackers_ok), trackersFailing: Int(s.trackers_failing), connecting: Int(s.connecting))
         }
     }
     func pause(_ id: String) { if let p = ptr { _ = tp_dl_pause(p, id) } }
@@ -57,24 +58,42 @@ final class TPDownloads {
     func saveAll() { if let p = ptr { tp_dl_save_all(p) } }
 }
 
-/// Reports whether the Mac has a usable network path (one monitor for the whole app). A satisfied path is only a hint: the core still waits for real progress before it says "Downloading".
+/// Observes the operating system's network path (one monitor for the whole app) and reports it as a NetworkPathSummary: unknown until the first update arrives, then
+/// unavailable or available with the kinds of interfaces present. "Available" is a hint only: the core waits for real progress before it says "Downloading".
 final class NetworkMonitor {
     private let monitor = NWPathMonitor()
     private let queue = DispatchQueue(label: "TorrentPlayer.network-path")
-    private(set) var online = true, expensive = false, constrained = false
-    var onChange: ((Bool) -> Void)?
+    private(set) var summary = NetworkPathSummary()                      // .unknown until the first callback
+    private(set) var updates = 0
+    var onChange: ((NetworkPathSummary) -> Void)?
+
+    static func summarize(_ p: NWPath) -> NetworkPathSummary {
+        var s = NetworkPathSummary()
+        s.status = p.status == .satisfied ? .available : .unavailable
+        var phys: [String] = []
+        for i in p.availableInterfaces {
+            switch i.type {
+            case .wifi: if !phys.contains("Wi-Fi") { phys.append("Wi-Fi") }
+            case .wiredEthernet: if !phys.contains("Ethernet") { phys.append("Ethernet") }
+            case .cellular: if !phys.contains("Cellular") { phys.append("Cellular") }
+            case .other: s.tunnels += 1
+            default: break
+            }
+        }
+        s.physical = phys; s.expensive = p.isExpensive; s.constrained = p.isConstrained
+        return s
+    }
     func start() {
         monitor.pathUpdateHandler = { [weak self] path in
+            let new = NetworkMonitor.summarize(path)
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                self.expensive = path.isExpensive; self.constrained = path.isConstrained
-                let now = path.status == .satisfied
-                if now != self.online { self.online = now; self.onChange?(now) } else if self.onChange != nil && !self.started { self.started = true; self.onChange?(now) }
+                self.updates += 1
+                if new != self.summary || self.updates == 1 { self.summary = new; self.onChange?(new) }
             }
         }
         monitor.start(queue: queue)
     }
-    private var started = false
     func stop() { monitor.cancel() }
 }
 

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -62,6 +63,8 @@ struct DownloadStatus {
   std::int64_t eta_s = -1;                                  // -1: unknown (never invented)
   bool user_paused = false, network_available = true, auto_play = true, completed = false;
   double checking_progress = 0;                             // 0..1 while Checking
+  int trackers_total = 0, trackers_ok = 0, trackers_failing = 0;   // announce results: answered successfully / last announce failed (the rest: not tried yet)
+  int connecting = 0;                                        // connection attempts in progress (not counted as sources)
 };
 
 class DownloadManager {
@@ -109,6 +112,8 @@ class DownloadManager {
   std::atomic<int> restores_applied_{0};
   std::chrono::steady_clock::time_point last_restore_{}, last_save_ = std::chrono::steady_clock::now();
   bool restore_pending_ = false;
+  std::ofstream diag_;                                      // TP_DL_DIAG=<file>: tracker, DHT and connection alerts (diagnostics only)
+  std::chrono::steady_clock::time_point diag_t0_ = std::chrono::steady_clock::now();
 };
 
 }  // namespace tp

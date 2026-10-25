@@ -63,8 +63,7 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         c.networkNote = { [weak self] in
             guard let self = self else { return "" }
             if self.options.loopback { return "Test network (loopback)." }
-            let n = self.netMonitor
-            return (n.online ? "Network available." : "No network connection: downloads wait and continue by themselves when it returns.") + (n.online && (n.expensive || n.constrained) ? " This connection is marked \(n.constrained ? "constrained" : "expensive"); downloads continue anyway." : "")
+            return self.netMonitor.summary.text
         }
         c.telemetry = { [weak self] name, facts in self?.telemetry.emit(name, facts) }
         return c
@@ -97,7 +96,11 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         let d = try TPDownloads(stateDir: downloadStateDirPath, listen: options.loopback ? "127.0.0.1:42902" : nil, loopback: options.loopback, autoResume: prefs.autoResumeOnNetwork)
         downloads = d
         if !options.loopback {                                                         // the path monitor describes the real network; loopback test runs must not depend on it
-            netMonitor.onChange = { [weak self, weak d] online in d?.setNetwork(online); self?.telemetry.emit("network_path", ["online": online, "expensive": self?.netMonitor.expensive ?? false, "constrained": self?.netMonitor.constrained ?? false]) }
+            netMonitor.onChange = { [weak self, weak d] sum in
+                if let online = sum.downloaderOnline { d?.setNetwork(online) }                  // unknown is not reported: the downloader assumes nothing until the system speaks
+                self?.telemetry.emit("network_path", ["status": "\(sum.status)", "wifi": sum.physical.contains("Wi-Fi"), "ethernet": sum.physical.contains("Ethernet"), "cellular": sum.physical.contains("Cellular"),
+                                                       "tunnels": sum.tunnels, "expensive": sum.expensive, "constrained": sum.constrained, "downloader_online": sum.downloaderOnline.map { "\($0)" } ?? "unknown"])
+            }
             netMonitor.start()
         }
         downloadsController.startTimer()

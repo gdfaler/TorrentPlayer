@@ -138,6 +138,7 @@ typedef struct {
   int64_t eta_s;                      /* -1 = unknown */
   int user_paused, network_available, auto_play, completed;
   double checking_progress;
+  int trackers_total, trackers_ok, trackers_failing, connecting;   /* announce results (answered / failed; the rest not tried yet) and connection attempts in progress */
 } tp_dl_status;
 
 tp_dlmgr* tp_dl_create(const tp_dl_config*, char* err, size_t errlen);
