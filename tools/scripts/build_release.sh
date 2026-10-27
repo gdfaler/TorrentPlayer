@@ -32,6 +32,18 @@ swiftc -O -swift-version 5 -target arm64-apple-macosx27.0 -module-name TorrentPl
   -framework AppKit -framework QuartzCore -framework UniformTypeIdentifiers \
   -o "$APP/Contents/MacOS/TorrentPlayer"
 cp app/Resources/Info.plist "$APP/Contents/Info.plist"
+# TP_BUILD_LABEL=<word> makes a development build that cannot be mistaken for the installed release: its own bundle id (own preferences, own Launch Services
+# identity), a visible name and version carrying the label and the Git commit. Without it the bundle is byte-for-byte the public release identity.
+DEVID=""
+if [ -n "${TP_BUILD_LABEL:-}" ]; then
+  case "$TP_BUILD_LABEL" in *[!A-Za-z0-9]*) echo "bad TP_BUILD_LABEL (letters and digits only): $TP_BUILD_LABEL" >&2; exit 2;; esac
+  GITSHA=$(git rev-parse --short=7 HEAD); GITDIRTY=""; [ -z "$(git status --porcelain --untracked-files=no)" ] || GITDIRTY="+dirty"
+  DEVID="io.github.gdfaler.TorrentPlayer.dev.$TP_BUILD_LABEL"
+  PB=/usr/libexec/PlistBuddy; PL="$APP/Contents/Info.plist"
+  "$PB" -c "Set :CFBundleIdentifier $DEVID" -c "Set :CFBundleName TorrentPlayer-DEV-$TP_BUILD_LABEL" -c "Set :CFBundleDisplayName TorrentPlayer DEV $TP_BUILD_LABEL" \
+        -c "Set :CFBundleShortVersionString $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PL")-dev.$GITSHA$GITDIRTY" -c "Set :CFBundleVersion dev.$GITSHA" \
+        -c "Add :TPBuildLabel string $TP_BUILD_LABEL" -c "Add :TPBuildCommit string $GITSHA$GITDIRTY" "$PL"
+fi
 
 echo "== 3/6 bundle the dynamic library closure"
 python3 - "$APP" "$OUT/dependency_inventory.txt" <<'PY'
@@ -235,7 +247,7 @@ ICDLIB=$(python3 -c "import json,os,sys; p=sys.argv[1]; print(os.path.normpath(o
 [ -f "$ICDLIB" ] || { echo "FAIL ICD library_path does not resolve inside the bundle: $ICDLIB"; fail=1; }
 plutil -lint "$APP/Contents/Info.plist" || fail=1
 BID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Contents/Info.plist")
-[ "$BID" = "io.github.gdfaler.TorrentPlayer" ] || { echo "FAIL bundle id: $BID"; fail=1; }
+[ "$BID" = "${DEVID:-io.github.gdfaler.TorrentPlayer}" ] || { echo "FAIL bundle id: $BID"; fail=1; }
 codesign --verify --strict --verbose=2 "$APP" 2>&1 | sed 's/^/codesign: /' || fail=1
 for f in "$APP"/Contents/Frameworks/*.dylib; do codesign --verify --strict "$f" 2> /dev/null || { echo "FAIL signature $f"; fail=1; }; done
 # informational: Homebrew paths embedded as strings (config/data locations); NOT counted as failures
@@ -250,3 +262,6 @@ echo "libraries: $(ls "$APP/Contents/Frameworks" | wc -l | tr -d ' ')"
 echo "inventory: $OUT/dependency_inventory.txt"
 [ "$fail" -eq 0 ] || { echo "VERIFICATION FAILED"; exit 1; }
 echo "verification passed (static checks only; NOT tested on another Mac; NOT notarized)"
+if [ -n "$DEVID" ]; then      # a development bundle also gets a distinct folder name
+  mv "$APP" "$OUT/TorrentPlayer-DEV-$TP_BUILD_LABEL.app"; echo "development bundle: $OUT/TorrentPlayer-DEV-$TP_BUILD_LABEL.app  ($DEVID, commit $GITSHA$GITDIRTY)"
+fi
