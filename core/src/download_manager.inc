@@ -310,6 +310,7 @@ bool DownloadManager::verified_complete(Entry& e) {
 }
 
 void DownloadManager::fill_status(Entry& e, DownloadStatus* o) {
+  *o = DownloadStatus{};                                                 // counters below are accumulated: a reused out-parameter must not carry the previous call over
   o->id = e.id; o->name = e.name; o->save_path = e.save_path.string(); o->files = e.files; o->auto_play = e.auto_play;
   o->selected_bytes = e.selected_bytes; o->user_paused = e.user_paused; o->network_available = online_.load(); o->error = e.error;
   if (e.ti) {

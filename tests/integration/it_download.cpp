@@ -499,10 +499,12 @@ static void sc_web_seed_counts_as_source() {               // a connected web se
   tp::DownloadManager m(make_cfg(root / "state", next_port())); const auto dest = root / "dest";
   tp::DownloadRequest r; r.torrent_bytes = wc.torrent; r.save_path = dest; r.files = {kVideo}; r.strip_trackers = true;
   const auto id = m.add(r); TP_CHECK(!id.empty()); if (id.empty()) return;
-  bool saw_sources = false, waiting_while_data_flows = false, saw_progress = false, silent_connected_seen = false, silent_connected_mislabelled = false;
+  bool saw_sources = false, waiting_while_data_flows = false, saw_progress = false, silent_connected_seen = false, silent_connected_mislabelled = false, reused_accumulates = false;
+  tp::DownloadStatus reused;                                // the same out-parameter on every poll: source counters must describe the moment, not add up (found with a real swarm: 1470 "peers" from 118)
   const auto t = Clock::now();
   while (secs_since(t) < 60) {
     const auto s = st(m, id);
+    m.status(id, &reused); if (reused.web_seeds > 1 || reused.peers > 0 || reused.connecting > 5) reused_accumulates = true;
     if (s.web_seeds >= 1) saw_sources = true;
     if (web.requests.load() >= 1 && s.verified_bytes == 0 && !s.completed) {     // the web seed has been asked and has not answered yet: it is connected, and a connected source must be counted and not shown as "Waiting for sources"
       silent_connected_seen = true; if (s.web_seeds < 1 || s.state == tp::DlState::WaitingForSources) silent_connected_mislabelled = true;
@@ -512,7 +514,7 @@ static void sc_web_seed_counts_as_source() {               // a connected web se
     if (s.completed) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
-  TP_CHECK(saw_sources); TP_CHECK(saw_progress); TP_CHECK(!waiting_while_data_flows); TP_CHECK(silent_connected_seen); TP_CHECK(!silent_connected_mislabelled); TP_CHECK(st(m, id).completed); TP_CHECK(file_matches(file_of(dest, kVideo), kVideo));
+  TP_CHECK(saw_sources); TP_CHECK(saw_progress); TP_CHECK(!waiting_while_data_flows); TP_CHECK(!reused_accumulates); TP_CHECK(silent_connected_seen); TP_CHECK(!silent_connected_mislabelled); TP_CHECK(st(m, id).completed); TP_CHECK(file_matches(file_of(dest, kVideo), kVideo));
 }
 
 int main(int argc, char** argv) {

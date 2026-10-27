@@ -69,7 +69,11 @@ final class NetworkMonitor {
 
     static func summarize(_ p: NWPath) -> NetworkPathSummary {
         var s = NetworkPathSummary()
-        s.status = p.status == .satisfied ? .available : .unavailable
+        switch p.status {
+        case .satisfied: s.status = .available
+        case .requiresConnection: s.status = .requiresConnection
+        default: s.status = .unavailable
+        }
         var phys: [String] = []
         for i in p.availableInterfaces {
             switch i.type {

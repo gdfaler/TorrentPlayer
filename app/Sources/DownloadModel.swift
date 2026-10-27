@@ -127,37 +127,41 @@ enum DownloadClick {
 /// What the operating system tells us about the network, kept apart from what the downloader can reach. A usable path is NOT proof that the internet or any
 /// torrent source is reachable (a VPN or tunnel interface stays up when Wi-Fi is switched off, and UDP or BitTorrent traffic may be blocked on a working path).
 struct NetworkPathSummary: Equatable {
-    enum Status: Equatable { case unknown, unavailable, available }
+    enum Status: Equatable { case unknown, unavailable, requiresConnection, available }
     var status = Status.unknown
-    var physical: [String] = []             // "Wi-Fi", "Ethernet", "Cellular" interfaces that are available
-    var tunnels = 0                         // VPN / tunnel / other interfaces
+    var physical: [String] = []             // "Wi-Fi", "Ethernet", "Cellular" interfaces that are available (informational only)
+    var tunnels = 0                         // VPN / tunnel / other interfaces (informational only)
     var expensive = false, constrained = false
 
-    /// What the downloader is told: nil while unknown, false without a path or when only tunnels exist (a tunnel needs a real network underneath), otherwise true.
+    /// What the downloader is told: nil while the path is unknown or only "requires a connection" (no pause or resume decision is taken), false only when the system
+    /// reports no usable path, true for every satisfied path. Which interfaces are listed never changes this (a VPN keeps the path satisfied with Wi-Fi off), and
+    /// neither does it say anything about whether trackers or peers can be reached: that is judged per download from real announce and connection results.
     var downloaderOnline: Bool? {
         switch status {
-        case .unknown: return nil
+        case .unknown, .requiresConnection: return nil
         case .unavailable: return false
-        case .available: return !physical.isEmpty
+        case .available: return true
         }
     }
     var headline: String {
         switch status {
         case .unknown: return "Checking the network…"
-        case .unavailable: return "No network connection."
+        case .unavailable: return "The system reports no network path."
+        case .requiresConnection: return "The system says a connection must be established first."
         case .available:
-            if physical.isEmpty { return "No real network connection: only a VPN or tunnel interface is active." }
-            return "Network connection present (" + physical.joined(separator: ", ") + (tunnels > 0 ? ", with a VPN or tunnel" : "") + ")."
+            if physical.isEmpty { return "The system reports a usable network path" + (tunnels > 0 ? " (through a VPN or tunnel interface)." : ".") }
+            return "The system reports a usable network path (" + physical.joined(separator: ", ") + (tunnels > 0 ? ", with a VPN or tunnel" : "") + ")."
         }
     }
     var detail: String {
         switch status {
         case .unknown: return "Waiting for the system to report the connection."
-        case .unavailable, .available where physical.isEmpty: return "Downloads wait and continue by themselves when a connection returns."
+        case .unavailable: return "Downloads wait and continue by themselves when a path returns."
+        case .requiresConnection: return "Downloads are left as they are until the system reports a path."
         case .available:
-            var s = "This only says an interface is up; it does not prove the internet or any torrent source can be reached."
+            var s = "This does not prove the internet, a tracker or any peer can be reached; each download shows that itself."
             if constrained { s += " The connection is marked constrained (Low Data Mode)." } else if expensive { s += " The connection is marked expensive." }
-            return s + " Downloads continue anyway."
+            return s
         }
     }
     var text: String { headline + " " + detail }
