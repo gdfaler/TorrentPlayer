@@ -42,7 +42,7 @@ struct DownloadManager::Entry {
   std::vector<std::string> fingerprint;                      // size:mtime of each selected file when the download completed (restart fast path)
   bool auto_play = true, user_paused = false, net_paused = false, completed = false, failed = false;
   std::int64_t selected_bytes = 0, last_verified = 0;
-  std::chrono::steady_clock::time_point resuming_since{}, no_source_since{}, last_redial{}, last_resume_save{};
+  std::chrono::steady_clock::time_point resuming_since{}, no_source_since{}, last_redial{}, last_resume_save{}, last_diag{};
   int redial_backoff_s = 10;
   std::atomic<int> resume_outstanding{0};
 };
@@ -499,6 +499,21 @@ void DownloadManager::tick() {
     if (!e.failed && !e.user_paused && s.is_finished && verified_complete(e)) { done.push_back(e.id); continue; }
     { auto fp = e.h.file_progress(lt::torrent_handle::piece_granularity); std::int64_t v = 0; for (int f : e.files) if (f < static_cast<int>(fp.size())) v += fp[static_cast<std::size_t>(f)]; if (v > e.last_verified) { e.last_verified = v; e.resuming_since = {}; } }
     if (now - e.last_resume_save >= std::chrono::seconds(cfg_.resume_save_interval_s) && !e.user_paused) { e.h.save_resume_data(lt::torrent_handle::only_if_modified); ++e.resume_outstanding; e.last_resume_save = now; }
+    if (diag_.is_open() && now - e.last_diag >= std::chrono::seconds(30)) {              // TP_DL_DIAG only: where the missing pieces are (counts, no addresses)
+      e.last_diag = now;
+      std::vector<lt::peer_info> pi; e.h.get_peer_info(pi); std::vector<int> av; e.h.piece_availability(av);
+      int np = static_cast<int>(av.size()), have = 0, missing_unavail = 0, missing_rare = 0, connecting = 0, shaking = 0, up = 0, seeds = 0, choked_us = 0, interesting = 0;
+      for (int i = 0; i < np; ++i) { if (e.h.have_piece(lt::piece_index_t(i))) { ++have; continue; } if (av[static_cast<std::size_t>(i)] == 0) ++missing_unavail; else if (av[static_cast<std::size_t>(i)] <= 2) ++missing_rare; }
+      for (auto const& p : pi) { if (p.flags & lt::peer_info::connecting) { ++connecting; continue; } if (p.flags & lt::peer_info::handshake) { ++shaking; continue; } ++up;
+                                 if (p.flags & lt::peer_info::seed) ++seeds; if (p.flags & lt::peer_info::remote_choked) ++choked_us; if (p.flags & lt::peer_info::interesting) ++interesting; }
+      char t[32]; std::snprintf(t, sizeof t, "[%8.2f] ", std::chrono::duration<double>(now - diag_t0_).count());
+      diag_ << t << "swarm: pieces have=" << have << " missing=" << (np - have) << " (offered by no connected peer=" << missing_unavail << ", by 1-2 peers=" << missing_rare << ")"
+            << " | peers connecting=" << connecting << " handshaking=" << shaking << " established=" << up << " seeds=" << seeds << " we-are-interested-in=" << interesting << " choking-us=" << choked_us
+            << " known=" << s.list_peers << " | tracker-reported seeds=" << s.num_complete << " leechers=" << s.num_incomplete << " | requested/downloading pieces=" << e.h.get_download_queue().size() << " | rate=" << s.download_payload_rate << "\n";
+      for (auto const& tr : e.h.trackers()) for (auto const& ep : tr.endpoints) for (auto const& ih : ep.info_hashes)
+        diag_ << t << "  tracker " << tr.url << ": fails=" << static_cast<int>(ih.fails) << (ih.updating ? " updating" : "") << (ih.message.empty() ? "" : " message=" + ih.message) << (ih.last_error ? " error=" + ih.last_error.message() : "") << "\n";
+      diag_.flush();
+    }
     // sources: while online, not paused and nothing is connected, re-announce and re-dial known peers with a growing, bounded pause
     if (!e.user_paused && !e.net_paused && !e.failed && online_.load() && s.num_peers == 0 && s.state != lt::torrent_status::checking_files) {
       if (e.no_source_since.time_since_epoch().count() == 0) { e.no_source_since = now; e.last_redial = now; }
