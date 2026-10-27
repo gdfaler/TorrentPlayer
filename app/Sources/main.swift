@@ -31,6 +31,8 @@ func parseOptions() -> AppOptions {
         case "--ao": o.audioOutput = next()
         case "--behind-seconds": o.behindSeconds = Double(next() ?? "")
         case "--ahead-seconds": o.aheadSeconds = Double(next() ?? "")
+        case "--download-dest": o.downloadDest = next()
+        case "--download-state-dir": o.downloadStateDir = next()
         case "--start-timeout": o.startTimeout = Double(next() ?? "") ?? 300; o.startTimeoutGiven = true
         default: break                                  // ignore macOS-injected flags like -NSDocumentRevisionsDebugMode
         }
@@ -50,6 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 #if TP_TESTING
         HomeTestDriver.startIfRequested(controller)
 #endif
+        controller.restoreDownloads()                                        // incomplete downloads from an earlier run continue by themselves
         NSApp.activate(ignoringOtherApps: true)
         NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(handleURLEvent(_:reply:)), forEventClass: AEEventClass(kInternetEventClass), andEventID: AEEventID(kAEGetURL))
         let early = openQueue.markReady()
@@ -67,9 +70,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if let s = controller?.session, !s.isEnding { s.end(reason: "app quit"); DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { NSApp.reply(toApplicationShouldTerminate: true) }; return .terminateLater }
+        // Downloads only run while the app runs: say so before quitting (not in automated runs). Their progress is saved either way.
+        if let c = controller, c.downloads != nil, !c.options.autotestMode {
+            c.downloadsController.refresh()
+            if c.downloadsController.activeCount > 0 {
+                let a = NSAlert(); a.messageText = "Downloads are still in progress"
+                a.informativeText = "TorrentPlayer downloads only while it is running. Progress is saved, and the downloads continue by themselves the next time you open TorrentPlayer. To keep downloading, close the window instead of quitting."
+                a.addButton(withTitle: "Quit"); a.addButton(withTitle: "Cancel")
+                if a.runModal() != .alertFirstButtonReturn { return .terminateCancel }
+            }
+        }
+        let ending = controller?.session.map { !$0.isEnding } ?? false
+        if ending { controller?.session?.end(reason: "app quit") }
+        let dl = controller?.downloads
+        if ending || dl != nil {
+            // the download core writes every download's resume data before it closes (bounded wait), off the main thread
+            DispatchQueue.global().async { dl?.shutdown(); DispatchQueue.main.asyncAfter(deadline: .now() + (ending ? 0.5 : 0)) { NSApp.reply(toApplicationShouldTerminate: true) } }
+            return .terminateLater
+        }
         return .terminateNow
     }
+    @objc func showDownloads(_ s: Any?) { controller.downloadsController.show() }
     func applicationShouldHandleReopen(_ app: NSApplication, hasVisibleWindows flag: Bool) -> Bool { if !flag { controller.window.makeKeyAndOrderFront(nil) }; return true }
 
     // Playback menu: every toolbar action is also reachable from the menu bar (keyboard and VoiceOver), without focusing the non-activating controls panel. No key equivalents: the
@@ -133,6 +154,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                              ("Mute / Unmute", #selector(playbackMute(_:))), ("Show More / Fewer Controls", #selector(playbackControlsSize(_:)))] {
             playback.addItem(withTitle: title, action: sel, keyEquivalent: "").target = self
         }
+        let windowItem = NSMenuItem(); main.addItem(windowItem)
+        let windowMenu = NSMenu(title: "Window"); windowItem.submenu = windowMenu
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        let dl = windowMenu.addItem(withTitle: "Downloads", action: #selector(showDownloads(_:)), keyEquivalent: "l"); dl.keyEquivalentModifierMask = [.command, .option]; dl.target = self
+        NSApp.windowsMenu = windowMenu
         NSApp.mainMenu = main
     }
 }

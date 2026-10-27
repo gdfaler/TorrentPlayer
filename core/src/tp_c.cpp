@@ -10,6 +10,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include "tpcore/download.hpp"
 #include "tpcore/engine.hpp"
 #include "tpcore/stream_session.hpp"
 
@@ -49,6 +50,7 @@ struct tp_meta {
   std::vector<std::string> extra_peers, trackers, web_seeds;     // from the magnet link: x.pe / tr / ws
 };
 struct tp_stream { std::shared_ptr<tp::StreamSession> s; };
+struct tp_dlmgr { std::unique_ptr<tp::DownloadManager> mgr; };
 
 static bool parse_ti(tp_meta* m, std::string* err) {
   try {
@@ -281,4 +283,50 @@ int tp_stream_last_hash_report(tp_stream* s, char* out, size_t outlen) {
   put(out, outlen, r); return static_cast<int>(r.size());
 }
 
+}  // extern "C"
+
+// ---- Download & Play
+static void fill_dl(const tp::DownloadStatus& s, tp_dl_status* o) {
+  std::memset(o, 0, sizeof *o);
+  put(o->id, sizeof o->id, s.id); put(o->name, sizeof o->name, s.name); put(o->save_path, sizeof o->save_path, s.save_path);
+  put(o->primary_file, sizeof o->primary_file, s.primary_file); put(o->error, sizeof o->error, s.error); put(o->state_text, sizeof o->state_text, tp::dl_state_name(s.state));
+  o->state = static_cast<int>(s.state); o->selected_bytes = s.selected_bytes; o->verified_bytes = s.verified_bytes; o->progress = s.progress;
+  o->download_rate = s.download_rate; o->upload_rate = s.upload_rate; o->peers = s.peers; o->web_seeds = s.web_seeds; o->eta_s = s.eta_s;
+  o->user_paused = s.user_paused; o->network_available = s.network_available; o->auto_play = s.auto_play; o->completed = s.completed; o->checking_progress = s.checking_progress;
+  o->trackers_total = s.trackers_total; o->trackers_ok = s.trackers_ok; o->trackers_failing = s.trackers_failing; o->connecting = s.connecting;
+}
+extern "C" {
+tp_dlmgr* tp_dl_create(const tp_dl_config* cfg, char* err, size_t errlen) {
+  try {
+    if (!cfg || !cfg->state_dir) { put(err, errlen, "state_dir required"); return nullptr; }
+    tp::DownloadConfig c; c.state_dir = std::filesystem::absolute(cfg->state_dir).lexically_normal();
+    if (cfg->listen_interfaces) c.listen_interfaces = cfg->listen_interfaces;
+    c.loopback_test_mode = cfg->loopback_test_mode != 0; c.enable_dht = cfg->enable_dht != 0; if (c.loopback_test_mode) { c.enable_lsd = false; c.min_reconnect_time_s = 1; }
+    c.auto_resume_on_network = cfg->auto_resume_on_network != 0;
+    auto* h = new tp_dlmgr; h->mgr = std::make_unique<tp::DownloadManager>(std::move(c)); return h;
+  } catch (std::exception const& e) { put(err, errlen, e.what()); return nullptr; } catch (...) { put(err, errlen, "unknown error"); return nullptr; }
+}
+void tp_dl_destroy(tp_dlmgr* d) { try { delete d; } catch (...) {} }
+int tp_dl_restore(tp_dlmgr* d) { try { return d ? d->mgr->restore() : 0; } catch (...) { return 0; } }
+int tp_dl_add(tp_dlmgr* d, tp_meta* m, const char* dest, const int* files, int nfiles, int auto_play, char* id_out, size_t idlen, char* err, size_t errlen) {
+  try {
+    if (!d || !m || !dest) { put(err, errlen, "bad arguments"); return 0; }
+    tp::DownloadRequest r; { std::lock_guard<std::mutex> g(m->mu); if (m->bytes.empty() || m->state != TP_META_READY) { put(err, errlen, "metadata is not ready"); return 0; } r.torrent_bytes = m->bytes; r.extra_peers = m->extra_peers; r.trackers = m->trackers; r.web_seed_urls = m->web_seeds; }
+    r.save_path = std::filesystem::absolute(dest).lexically_normal(); r.auto_play = auto_play != 0;
+    for (int i = 0; i < nfiles && files; ++i) r.files.push_back(files[i]);
+    std::string e; const auto id = d->mgr->add(r, &e);
+    if (id.empty()) { put(err, errlen, e); return 0; }
+    put(id_out, idlen, id); return 1;
+  } catch (std::exception const& e) { put(err, errlen, e.what()); return 0; } catch (...) { put(err, errlen, "unknown error"); return 0; }
+}
+int tp_dl_list(tp_dlmgr* d, tp_dl_status* out, int max) {
+  try { if (!d || !out || max <= 0) return 0; auto v = d->mgr->list(); int n = 0; for (auto const& s : v) { if (n >= max) break; fill_dl(s, &out[n++]); } return n; } catch (...) { return 0; }
+}
+int tp_dl_get(tp_dlmgr* d, const char* id, tp_dl_status* out) { try { tp::DownloadStatus s; if (!d || !id || !out || !d->mgr->status(id, &s)) return 0; fill_dl(s, out); return 1; } catch (...) { return 0; } }
+int tp_dl_pause(tp_dlmgr* d, const char* id) { try { return d && id && d->mgr->pause(id) ? 1 : 0; } catch (...) { return 0; } }
+int tp_dl_resume(tp_dlmgr* d, const char* id) { try { return d && id && d->mgr->resume(id) ? 1 : 0; } catch (...) { return 0; } }
+int tp_dl_cancel(tp_dlmgr* d, const char* id, int del) { try { return d && id && d->mgr->cancel(id, del != 0) ? 1 : 0; } catch (...) { return 0; } }
+void tp_dl_set_network(tp_dlmgr* d, int online) { try { if (d) d->mgr->set_network_available(online != 0); } catch (...) {} }
+void tp_dl_set_auto_resume(tp_dlmgr* d, int on) { try { if (d) d->mgr->set_auto_resume_on_network(on != 0); } catch (...) {} }
+void tp_dl_save_all(tp_dlmgr* d) { try { if (d) d->mgr->save_all(); } catch (...) {} }
 }  // extern "C"

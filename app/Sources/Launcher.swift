@@ -21,6 +21,8 @@ struct AppOptions {
     var startTimeoutGiven = false
     var startTimeout = 300.0                // --start-timeout S: end an autotest if playback never starts
     var openScript: [(after: Double, path: String)] = []   // --open-script "6:/path/b.mkv": N seconds after playback starts, open another item (acceptance runs of source switching)
+    var downloadDest: String?               // --download-dest DIR: a torrent opened with --autoplay is downloaded (Download & Play) into DIR instead of streamed
+    var downloadStateDir: String?           // --download-state-dir DIR: where Download & Play keeps its bookkeeping (tests)
     var autotestMode: Bool { exitAfter != nil || !seekScript.isEmpty || startTimeoutGiven || !openScript.isEmpty }
 }
 
@@ -49,6 +51,23 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     var failureRetryable = true
     var failureDetailHasFileName = false                           // the shown message names a recent file: it stays out of telemetry
     private var fadeGeneration = 0
+    // Download & Play
+    var downloads: TPDownloads?
+    let netMonitor = NetworkMonitor()
+    private var choiceSheet: DownloadChoiceSheet?
+    lazy var downloadsController: DownloadsController = {
+        let c = DownloadsController(defaults: AppDefaults.shared, host: { [weak self] in self?.downloads })
+        c.playerBusy = { [weak self] in self?.session != nil }
+        c.onPlay = { [weak self] it in self?.open(requests: [it.primaryFile]) }          // the finished, verified file goes through the ordinary local-file path
+        c.onAutoResumeChanged = { [weak self] on in self?.downloads?.setAutoResume(on) }
+        c.networkNote = { [weak self] in
+            guard let self = self else { return "" }
+            if self.options.loopback { return "Test network (loopback)." }
+            return self.netMonitor.summary.text
+        }
+        c.telemetry = { [weak self] name, facts in self?.telemetry.emit(name, facts) }
+        return c
+    }()
     var switcher = SwitchCoordinator()
     let recents = RecentsStore(defaults: AppDefaults.shared)       // recently played LOCAL videos (never torrents or magnet links); isolated suite in automated tests
 
@@ -67,6 +86,66 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         if let a = options.aheadSeconds { settings.aheadSeconds = a }
         settings.webSeedMode = options.webSeedMode; settings.mute = options.mute; settings.audioOutput = options.audioOutput
         buildUI()
+    }
+
+    // MARK: Download & Play
+    var downloadStateDirPath: String { options.downloadStateDir ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/TorrentPlayer/Downloads").path }
+    func ensureDownloads() throws -> TPDownloads {
+        if let d = downloads { return d }
+        let prefs = DownloadPreferences.load(AppDefaults.shared)
+        let d = try TPDownloads(stateDir: downloadStateDirPath, listen: options.loopback ? "127.0.0.1:42902" : nil, loopback: options.loopback, autoResume: prefs.autoResumeOnNetwork)
+        downloads = d
+        if !options.loopback {                                                         // the path monitor describes the real network; loopback test runs must not depend on it
+            netMonitor.onChange = { [weak self, weak d] sum in
+                if let online = sum.downloaderOnline { d?.setNetwork(online) }                  // unknown is not reported: the downloader assumes nothing until the system speaks
+                self?.telemetry.emit("network_path", ["status": "\(sum.status)", "wifi": sum.physical.contains("Wi-Fi"), "ethernet": sum.physical.contains("Ethernet"), "cellular": sum.physical.contains("Cellular"),
+                                                       "tunnels": sum.tunnels, "expensive": sum.expensive, "constrained": sum.constrained, "downloader_online": sum.downloaderOnline.map { "\($0)" } ?? "unknown"])
+            }
+            netMonitor.start()
+        }
+        downloadsController.startTimer()
+        return d
+    }
+    /// At launch: if earlier downloads are persisted, bring them back (incomplete ones continue by themselves; user-paused ones stay paused).
+    func restoreDownloads() {
+        guard let items = try? FileManager.default.contentsOfDirectory(atPath: downloadStateDirPath), !items.isEmpty else { return }
+        guard let d = try? ensureDownloads() else { return }
+        let n = d.restore(); telemetry.emit("downloads_restored", ["count": n])
+    }
+    func chooseHowToWatch(_ file: TPMeta.FileEntry) {
+        if let dest = options.downloadDest { startDownload(file: file, prefs: DownloadPreferences(downloadMode: true, wholeTorrent: false, destination: dest, autoPlay: true, autoResumeOnNetwork: true)); return }
+        var skipSheet = options.autoplay || options.autotestMode
+#if TP_TESTING
+        if ProcessInfo.processInfo.environment["TP_HOME_SCRIPT"] != nil { skipSheet = true }
+#endif
+        if skipSheet { startPlayback(file: file); return }
+        let sheet = DownloadChoiceSheet(prefs: DownloadPreferences.load(AppDefaults.shared)); choiceSheet = sheet
+        let total = files.reduce(Int64(0)) { $0 + $1.size }
+        sheet.present(over: window, fileName: (file.path as NSString).lastPathComponent, wholeTorrentLabel: "Entire torrent (\(files.count) files, \(DownloadFormat.bytes(total)))") { [weak self] choice in
+            guard let self = self else { return }
+            self.choiceSheet = nil
+            guard let c = choice else { return }
+            c.save(AppDefaults.shared)
+            if c.downloadMode { self.startDownload(file: file, prefs: c) } else { self.startPlayback(file: file) }
+        }
+    }
+    func startDownload(file: TPMeta.FileEntry, prefs: DownloadPreferences) {
+        guard let m = meta else { return }
+        do {
+            let d = try ensureDownloads()
+            switch d.add(meta: m, destination: prefs.destination, files: prefs.wholeTorrent ? [] : [file.index], autoPlay: prefs.autoPlay) {
+            case .success:
+                telemetry.emit("download_added", ["whole_torrent": prefs.wholeTorrent, "from_magnet": m.fromMagnet, "auto_play": prefs.autoPlay])
+                meta = nil; files = []; phase = .idle
+                downloadsController.show()
+            case .failure(let e): showDownloadError(e.description)
+            }
+        } catch { showDownloadError("\(error)") }
+    }
+    func showDownloadError(_ message: String) {
+        telemetry.emit("download_add_failed", [:])
+        let a = NSAlert(); a.messageText = "Could not start the download"; a.informativeText = message; a.alertStyle = .warning; a.addButton(withTitle: "OK")
+        a.beginSheetModal(for: window, completionHandler: nil)
     }
 
     // MARK: engine
@@ -196,7 +275,7 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     @objc func pasteMagnet() { openMagnet((NSPasteboard.general.string(forType: .string) ?? "").trimmingCharacters(in: .whitespacesAndNewlines), fromClipboard: true) }
     @objc func cancelFetch() { metaTimer?.invalidate(); meta?.cancel(); telemetry.emit("metadata_cancelled", [:]); meta = nil; phase = .idle }
     @objc func retryOpen() { if !openedSource.isEmpty { open(source: openedSource) } else { phase = .idle } }
-    @objc func playSelected() { let r = table.selectedRow; guard r >= 0, r < files.count else { return }; startPlayback(file: files[r]) }
+    @objc func playSelected() { let r = table.selectedRow; guard r >= 0, r < files.count else { return }; chooseHowToWatch(files[r]) }
 
     // MARK: home <-> playback transition (a short fade of the home window; instant under Reduce Motion)
     func hideHome() {
@@ -309,7 +388,7 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         meta = m; files = m.files()
         telemetry.emit("metadata_ready", ["name": m.name, "files": files.count, "fetch_s": Date().timeIntervalSince(fetchStartedAt), "from_magnet": m.fromMagnet])
         let defIdx = options.fileIndex ?? m.defaultVideo
-        if options.autoplay, defIdx >= 0, defIdx < files.count { phase = .choosing; startPlayback(file: files[defIdx]); return }
+        if options.autoplay, defIdx >= 0, defIdx < files.count { phase = .choosing; chooseHowToWatch(files[defIdx]); return }
         phase = .choosing
         if let i = files.firstIndex(where: { $0.index == defIdx }) { table.selectRowIndexes(IndexSet(integer: i), byExtendingSelection: false); table.scrollRowToVisible(i) }
         home.setPlayEnabled(table.selectedRow >= 0)
@@ -369,7 +448,8 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         print("AUTOTEST DONE reason=\(reason) telemetry=\(telemetry.url.path)")
         fflush(stdout)
         telemetry.close()
-        NSApp.terminate(nil)
+        // not from inside a main-queue block: terminate runs a nested event loop in which the quit handler's deferred reply (a main-queue block) could never run
+        RunLoop.main.perform { NSApp.terminate(nil) }
     }
 
     // MARK: table

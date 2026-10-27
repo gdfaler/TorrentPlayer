@@ -118,6 +118,43 @@ int tp_stream_events(tp_stream*, char* out, size_t outlen);
 /* Hash-failure evidence is classified by the core; this returns a one-line summary of the last report ("" if none). */
 int tp_stream_last_hash_report(tp_stream*, char* out, size_t outlen);
 
+/* ---- Download & Play: complete, hash-verified downloads into a user-chosen folder; state survives restarts (see tpcore/download.hpp) */
+typedef struct tp_dlmgr tp_dlmgr;
+typedef struct {
+  const char* state_dir;              /* per-download bookkeeping (torrent, resume data, state); required */
+  const char* listen_interfaces;      /* NULL = "0.0.0.0:6882,[::]:6882" */
+  int loopback_test_mode;             /* tests only */
+  int enable_dht;                     /* 0 disables (tests) */
+  int auto_resume_on_network;         /* 1 = continue automatically when the network returns */
+} tp_dl_config;
+typedef enum {
+  TP_DL_CHECKING = 0, TP_DL_DOWNLOADING, TP_DL_WAITING_NETWORK, TP_DL_WAITING_SOURCES, TP_DL_PAUSED, TP_DL_RESUMING, TP_DL_COMPLETED, TP_DL_FAILED
+} tp_dl_state;
+typedef struct {
+  char id[48]; char name[256]; char save_path[1024]; char primary_file[1536]; char error[256]; char state_text[32];
+  int state;                          /* tp_dl_state */
+  int64_t selected_bytes, verified_bytes; double progress;          /* verified = bytes of hash-verified pieces inside the selected files */
+  int download_rate, upload_rate, peers, web_seeds;
+  int64_t eta_s;                      /* -1 = unknown */
+  int user_paused, network_available, auto_play, completed;
+  double checking_progress;
+  int trackers_total, trackers_ok, trackers_failing, connecting;   /* announce results (answered / failed; the rest not tried yet) and connection attempts in progress */
+} tp_dl_status;
+
+tp_dlmgr* tp_dl_create(const tp_dl_config*, char* err, size_t errlen);
+void tp_dl_destroy(tp_dlmgr*);        /* graceful: writes resume data first */
+int tp_dl_restore(tp_dlmgr*);         /* re-adds persisted downloads; returns how many exist */
+/* files/nfiles: selected indices (nfiles 0 = whole torrent). The metadata's known peers/trackers/web seeds are used. Returns 1 and the id on success. */
+int tp_dl_add(tp_dlmgr*, tp_meta*, const char* dest_folder, const int* files, int nfiles, int auto_play, char* id_out, size_t idlen, char* err, size_t errlen);
+int tp_dl_list(tp_dlmgr*, tp_dl_status* out, int max);            /* returns the number of entries written */
+int tp_dl_get(tp_dlmgr*, const char* id, tp_dl_status* out);      /* 1 if found */
+int tp_dl_pause(tp_dlmgr*, const char* id);
+int tp_dl_resume(tp_dlmgr*, const char* id);
+int tp_dl_cancel(tp_dlmgr*, const char* id, int delete_files);    /* files are kept unless delete_files != 0 */
+void tp_dl_set_network(tp_dlmgr*, int online);                    /* from the OS path monitor */
+void tp_dl_set_auto_resume(tp_dlmgr*, int on);
+void tp_dl_save_all(tp_dlmgr*);
+
 #ifdef __cplusplus
 }
 #endif

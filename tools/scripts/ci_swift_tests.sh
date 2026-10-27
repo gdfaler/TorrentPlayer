@@ -22,4 +22,5 @@ run playback_keys   app/Sources/PlaybackKeys.swift tests/app/playback_keys_test.
 run playback_telem  app/Sources/PlaybackTelemetry.swift tests/app/playback_telemetry_test.swift
 run recent_files    app/Sources/RecentFiles.swift tests/app/recent_files_test.swift
 run seek_tracker    app/Sources/SeekTracker.swift tests/app/seek_tracker_test.swift
+run download_model   app/Sources/DownloadModel.swift tests/app/download_model_test.swift
 echo "swift unit tests: all suites passed"
