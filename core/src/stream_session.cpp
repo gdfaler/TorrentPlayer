@@ -329,6 +329,36 @@ void StreamSession::release_stalled_web_seeds(double) {
   }
 }
 
+// Unclaimed demand piece. libtorrent handles a web-seed redirect per file: the configured seed forgets the redirected file and the redirect target learns only that file. A piece that spans two files
+// (for example the end of the previous file plus the start of the selected video) is then advertised by neither: the original seed lacks the video file, the target lacks the other file, and
+// nothing ever requests the missing file's bytes from the original seed, so the target never learns it either. The reader waits for a piece that nobody has requested and that no peer has. Re-adding the
+// configured seed gives it its full file list again; its next request for the piece is redirected for BOTH files and the target then advertises the whole piece. Bounded: only while the reader is blocked
+// on a piece that has no requested block, is not in the download queue and is advertised by no peer, after kUnclaimedSeconds, at most kMaxRefreshes times per piece, kRefreshPauseSeconds apart.
+// Hash verification is untouched: only the connection state of the configured seeds is refreshed.
+static constexpr double kUnclaimedSeconds = 5.0, kRefreshPauseSeconds = 5.0;
+static constexpr int kMaxRefreshes = 8;
+
+void StreamSession::refresh_unclaimed_web_seeds(double t) {
+  const WaitInfo& w = wait_cache_;
+  if (w.piece != unclaimed_piece_) { unclaimed_piece_ = w.piece; refresh_count_ = 0; next_refresh_t_ = 0; unclaimed_since_ = -1; }
+  const bool unclaimed = web_enabled_ && !strip_web_always_ && !web_urls_.empty() && blocked_.load() > 0 && w.piece >= 0 && !store_->has(w.piece) &&
+                         w.blocks_done == 0 && w.blocks_writing == 0 && w.peers_with_piece == 0 && w.blocks_requested == 0 && !w.in_queue;
+  if (!unclaimed) { unclaimed_since_ = -1; return; }
+  if (unclaimed_since_ < 0) { unclaimed_since_ = t; return; }
+  if (t - unclaimed_since_ < kUnclaimedSeconds || t < next_refresh_t_ || refresh_count_ >= kMaxRefreshes) return;
+  int n = 0;
+  for (auto const& u : web_urls_) {
+    if (web_seed_off(u)) continue;                                       // released for a penalty: the release logic puts it back
+    h_.remove_url_seed(u); h_.add_url_seed(u); ++n;
+  }
+  if (n == 0) return;
+  ++refresh_count_;
+  next_refresh_t_ = t + kRefreshPauseSeconds;
+  unclaimed_since_ = t;
+  log_event("refreshed " + std::to_string(n) + " web seed(s): piece " + std::to_string(w.piece) + " has had no request, no queue entry and no advertising peer for " +
+            std::to_string(static_cast<int>(kUnclaimedSeconds)) + " s (attempt " + std::to_string(refresh_count_) + " of " + std::to_string(kMaxRefreshes) + ")");
+}
+
 // ============================================================== scheduler
 void StreamSession::scheduler_loop() {
   int n = 0;
@@ -568,6 +598,7 @@ void StreamSession::tick() {
   if (tick_no % 10 == 5 && s.num_peers > 0) update_known_peers();                 // every second while any peer is connected
   if (tick_no % 10 == 7 && !checking) { try { release_stalled_web_seeds(t); } catch (std::exception const& e) { log_event(std::string("web seed stall check exception: ") + e.what()); } }
   if (tick_no % 10 == 3 && !checking) { try { update_wait_info(t); } catch (std::exception const& e) { log_event(std::string("wait diagnostics exception: ") + e.what()); } }
+  if (tick_no % 10 == 9 && !checking) { try { refresh_unclaimed_web_seeds(t); } catch (std::exception const& e) { log_event(std::string("web seed refresh exception: ") + e.what()); } }
 
   // ---- window plan, protection, eviction, reconciliation
   int head; { std::lock_guard<std::mutex> g(est_mu_); head = geo_.piece_of_file_offset(est_.offset()); }
