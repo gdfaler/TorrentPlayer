@@ -503,10 +503,11 @@ static void sc_web_seed_counts_as_source() {               // a connected web se
   tp::DownloadStatus reused;                                // the same out-parameter on every poll: source counters must describe the moment, not add up (found with a real swarm: 1470 "peers" from 118)
   const auto t = Clock::now();
   while (secs_since(t) < 60) {
+    const int web_requests = web.requests.load();      // read BEFORE the snapshot: a request the server has seen implies a connection libtorrent already had, so the snapshot cannot predate it
     const auto s = st(m, id);
     m.status(id, &reused); if (reused.web_seeds > 1 || reused.peers > 0 || reused.connecting > 5) reused_accumulates = true;
     if (s.web_seeds >= 1) saw_sources = true;
-    if (web.requests.load() >= 1 && s.verified_bytes == 0 && !s.completed) {     // the web seed has been asked and has not answered yet: it is connected, and a connected source must be counted and not shown as "Waiting for sources"
+    if (web_requests >= 1 && s.verified_bytes == 0 && !s.completed) {     // the web seed has been asked and has not answered yet: it is connected, and a connected source must be counted and not shown as "Waiting for sources"
       silent_connected_seen = true; if (s.web_seeds < 1 || s.state == tp::DlState::WaitingForSources) silent_connected_mislabelled = true;
     }
     if (s.verified_bytes > 0) saw_progress = true;
