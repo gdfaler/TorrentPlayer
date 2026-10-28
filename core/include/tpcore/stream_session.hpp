@@ -167,6 +167,10 @@ class StreamSession {
   std::shared_ptr<WebEpMap> web_ep_;                        // filled once by a detached resolver thread that owns only a copy of the URLs and this shared state (never blocks shutdown)
   bool web_enabled_ = false;                                // the policy currently has the web seeds added; scheduler thread only
   void release_stalled_web_seeds(double t);
+  // ---- unclaimed demand piece: libtorrent web-seed redirects are per file, so a piece that spans two files can end up advertised by no web seed at all (see refresh_unclaimed_web_seeds)
+  double unclaimed_since_ = -1, next_refresh_t_ = 0;        // scheduler thread only
+  int unclaimed_piece_ = -1, refresh_count_ = 0;
+  void refresh_unclaimed_web_seeds(double t);
   bool web_seed_off(const std::string& url) const { auto it = web_stall_.find(url); return it != web_stall_.end() && it->second.off; }
   std::map<int, int> deadlines_applied_;                    // piece -> deadline (ms) most recently requested; scheduler thread only
 };

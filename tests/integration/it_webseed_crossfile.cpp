@@ -2,7 +2,7 @@
 // Geometry (synthetic): the selected "MP4" starts in the MIDDLE of piece 3, which also holds the tail of the previous file (the "demand piece"). A redirecting seed answers every request with a
 // 302 to a hidden healthy server (libtorrent then learns that server per file; it advertises only the files it was redirected for); the plain seed holds every file.
 // Scenarios: direct (control); xfile_delayed* (plain seed answers its first request after 14 s: it must NOT be released and the piece must finish near the 14 s mark);
-// xfile_stalled* (plain seed never answers: informational, completion is not required, connection churn must stay bounded); *B variants list the plain seed first.
+// xfile_redirect_only (only a redirecting seed: the demand piece must complete; needs the web-seed refresh); xfile_stalled* (plain seed never answers: informational, completion is not required, connection churn must stay bounded); *B variants list the plain seed first.
 // Fully local (127.0.0.1), synthetic data, no BitTorrent peers. Build/run: tools/scripts/run_webseed_crossfile.sh [seconds-per-run] [scenario]. Exit status 1 if an assertion fails.
 #include "loopback_fixture.hpp"
 #include <arpa/inet.h>
@@ -143,7 +143,7 @@ Run run(const char* label, const std::vector<Spec>& sv, double budget_s, int bas
     for (auto& kv : life) { double mx = 0, mn = 1e9; for (double d : kv.second.second) { mx = std::max(mx, d); mn = std::min(mn, d); }
       ITLOG("server S%d (%s): %d connections, %zu closed (lifetime %.1f..%.1f s), %lld bytes sent", kv.first, sv[kv.first].mode == Mode::Redirect ? "redirector" : sv[kv.first].mode == Mode::Stalled ? "STALLED" : sv[kv.first].mode == Mode::Delayed ? "DELAYED" : "healthy", kv.second.first, kv.second.second.size(), kv.second.second.empty() ? 0.0 : mn, mx, (long long)srv[kv.first]->bytes.load()); }
     int shown = 0; for (auto& e : g_ev) if ((e.what.rfind("GET", 0) == 0 || e.what.rfind("302", 0) == 0) && shown++ < 40) ITLOG("  t=%6.2f S%d conn%d %s", e.t, e.server, e.conn, e.what.c_str()); }
-  for (auto const& e : ss->recent_events()) if (e.find("released stalled") != std::string::npos || e.find("web seed back") != std::string::npos || e.find("web seed policy") != std::string::npos || e.find("re-adding") != std::string::npos || e.find("WEB SEED ALERT") != std::string::npos || e.find("read blocked") != std::string::npos) ITLOG("  session event %s", e.c_str());
+  for (auto const& e : ss->recent_events()) if (e.find("released stalled") != std::string::npos || e.find("refreshed") != std::string::npos || e.find("web seed back") != std::string::npos || e.find("web seed policy") != std::string::npos || e.find("re-adding") != std::string::npos || e.find("WEB SEED ALERT") != std::string::npos || e.find("read blocked") != std::string::npos) ITLOG("  session event %s", e.c_str());
   for (auto const& e : ss->recent_events()) { if (e.find("released stalled") != std::string::npos) ++r.releases; if (e.find("web seed back") != std::string::npos) ++r.readds_after_penalty; }
   ITLOG("%s: demand piece %s%s | verified pieces at end %d | actual torrent re-adds %d (watchdog-initiated %d), re-dial checks %d | redirects %d for %zu file(s) | demand priority %d..%d, deadline!=0 in %d samples | max no-progress %.1f s | stalled-seed releases %d, re-added after penalty %d", label,
         r.done ? "COMPLETE at t=" : "NOT complete", r.done ? std::to_string(r.done_s).substr(0, 5).c_str() : "", r.verified_end, r.resets, r.wd_resets, r.kicks, r.redirects, r.redirected_files.size(), r.prio_min, r.prio_max, r.deadline_nonzero_samples, r.max_no_progress, r.releases, r.readds_after_penalty);
@@ -158,6 +158,7 @@ int main(int argc, char** argv) {
   struct Sc { const char* key; const char* label; std::vector<Spec> servers; bool delayed, stalled; };
   const std::vector<Sc> all = {
     {"direct", "direct_healthy_seed", {{Mode::Healthy}}, false, false},
+    {"xfile_redirect_only", "xfile_redirecting_seed_only", {{Mode::Redirect, 1}, paced}, false, false},
     {"xfile_delayed", "xfile_plain_seed_delayed_14s", {{Mode::Redirect, 2}, {Mode::Delayed, -1, false, 14.0}, paced}, true, false},
     {"xfileB_delayed", "xfileB_plain_first_delayed_14s", {{Mode::Delayed, -1, false, 14.0}, {Mode::Redirect, 2}, paced}, true, false},
     {"xfile_stalled", "xfile_plain_seed_stalled", {{Mode::Redirect, 2}, {Mode::Stalled}, paced}, false, true},
@@ -172,6 +173,10 @@ int main(int argc, char** argv) {
     if (sc.delayed) {
       if (!r.done || r.done_s > 25.0) { ITLOG("ASSERT FAILED: delayed plain seed: the demand piece must complete within 25 s (release-disabled baseline 15.6 s, with the old release policy 40.8 s)"); ++failures; }
       if (r.releases != 0) { ITLOG("ASSERT FAILED: the only source able to serve the cross-file piece was released (%d)", r.releases); ++failures; }
+    }
+    if (std::string(sc.key) == "xfile_redirect_only") {      // fixed by refreshing unclaimed web seeds: without the refresh the cross-file demand piece is claimed by no seed and never completes (0 of 3 runs in 60-90 s)
+      if (!r.done || r.done_s > 75.0) { ITLOG("ASSERT FAILED: redirecting seed only: the demand piece must complete within 75 s (measured 22-47 s; did not complete in 70-90 s without the refresh)"); ++failures; }
+      for (int i = 0; i < 3; ++i) if (r.conns[i] > 24) { ITLOG("ASSERT FAILED: connection churn: server S%d saw %d connections (bound 24; measured up to 21)", i, r.conns[i]); ++failures; }
     }
     if (sc.stalled) {      // informational: completion is not required; churn must stay bounded and the harness must not claim success it did not see
       if (r.releases > 1) { ITLOG("ASSERT FAILED: stalled plain seed released %d times within one run (penalties must space releases out)", r.releases); ++failures; }
