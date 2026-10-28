@@ -422,6 +422,46 @@ static void sc_cancel_delete_scope() {                     // "delete" removes t
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
   TP_CHECK(file_matches(file_of(dest2, 0), 0));
 }
+static void sc_delete_provenance() {                        // "Delete" removes exactly the files this program created, tells the user about the rest, and never loses a download silently
+  const auto root = fresh(g_base, "delprov"); Seeder fast(*g_content, next_port(), 0), slow(*g_content, next_port(), kSlow);
+  auto progressed = [&](tp::DownloadManager& m, const std::string& id) { return wait_for(40, [&] { return st(m, id).verified_bytes >= kFiles[kVideo].size / 4; }); };
+  // A: a completed download that is removed with "delete" leaves nothing behind
+  { const auto dest = root / "A"; tp::DownloadManager m(make_cfg(root / "stateA", next_port())); const auto id = m.add(make_req(*g_content, dest, {kVideo}, fast.ep()));
+    TP_CHECK(wait_state(m, id, tp::DlState::Completed, 60)); TP_CHECK(fs::exists(file_of(dest, kVideo)));
+    const auto r = m.cancel_ex(id, true); TP_CHECK(r.found); TP_CHECK(r.ok); TP_CHECK(r.kept.empty()); TP_CHECK(!r.deleted.empty());
+    TP_CHECK(!fs::exists(file_of(dest, kVideo))); TP_CHECK(fs::is_directory(dest)); TP_CHECK(m.list().empty()); }
+  // B: the reported failure. Cancel with "keep", download the same torrent again into the same folder, then delete: the file the program itself created earlier is not "pre-existing"
+  { const auto dest = root / "B"; const auto state = root / "stateB"; std::string id;
+    { tp::DownloadManager m(make_cfg(state, next_port())); id = m.add(make_req(*g_content, dest, {kVideo}, slow.ep())); TP_CHECK(progressed(m, id)); TP_CHECK(m.cancel(id, false)); }
+    TP_CHECK(fs::exists(file_of(dest, kVideo)));
+    { tp::DownloadManager m(make_cfg(state, next_port())); id = m.add(make_req(*g_content, dest, {kVideo}, slow.ep())); TP_CHECK(!id.empty());
+      TP_CHECK(wait_for(20, [&] { return st(m, id).verified_bytes > 0; }));
+      const auto r = m.cancel_ex(id, true); TP_CHECK(r.ok); TP_CHECK(r.kept.empty()); LOG("delete after keep+re-add: deleted %zu, kept %zu", r.deleted.size(), r.kept.size());
+      TP_CHECK(!fs::exists(file_of(dest, kVideo))); }
+  }
+  // C: a paused partial download
+  { const auto dest = root / "C"; tp::DownloadManager m(make_cfg(root / "stateC", next_port())); const auto id = m.add(make_req(*g_content, dest, {kVideo}, slow.ep()));
+    TP_CHECK(progressed(m, id)); TP_CHECK(m.pause(id)); const auto r = m.cancel_ex(id, true); TP_CHECK(r.ok); TP_CHECK(r.kept.empty()); TP_CHECK(!fs::exists(file_of(dest, kVideo))); }
+  // D: a file that was in the folder before the download started is the user's: kept, reported, byte-identical
+  { const auto dest = root / "D"; fs::create_directories(dest / "t"); fs::copy_file(g_content->root / kFiles[kVideo].path, file_of(dest, kVideo));
+    tp::DownloadManager m(make_cfg(root / "stateD", next_port())); const auto id = m.add(make_req(*g_content, dest, {kVideo}, fast.ep())); TP_CHECK(!id.empty());
+    TP_CHECK(wait_state(m, id, tp::DlState::Completed, 60));
+    const auto r = m.cancel_ex(id, true); TP_CHECK(r.found); TP_CHECK(r.ok); TP_CHECK(!r.kept.empty()); TP_CHECK(!r.message.empty()); LOG("protected file reported: %s", r.message.c_str());
+    TP_CHECK(file_matches(file_of(dest, kVideo), kVideo)); }
+  // E: the user replaced the finished file with their own (a different file at the same path): not provably ours any more, so it stays
+  { const auto dest = root / "E"; tp::DownloadManager m(make_cfg(root / "stateE", next_port())); const auto id = m.add(make_req(*g_content, dest, {kVideo}, fast.ep()));
+    TP_CHECK(wait_state(m, id, tp::DlState::Completed, 60)); const auto f = file_of(dest, kVideo);
+    fs::remove(f); { std::ofstream(f) << "the user's own file"; }
+    const auto r = m.cancel_ex(id, true); TP_CHECK(r.ok); TP_CHECK(!r.kept.empty()); TP_CHECK(fs::exists(f)); }
+  // F: deletion fails (read-only folder): the download is NOT silently dropped, the error is reported, and a retry after fixing the folder succeeds
+  { const auto dest = root / "F"; tp::DownloadManager m(make_cfg(root / "stateF", next_port())); const auto id = m.add(make_req(*g_content, dest, {kVideo}, fast.ep()));
+    TP_CHECK(wait_state(m, id, tp::DlState::Completed, 60)); const auto f = file_of(dest, kVideo); const auto dir = f.parent_path();
+    fs::permissions(dir, fs::perms::owner_read | fs::perms::owner_exec, fs::perm_options::replace);
+    const auto r = m.cancel_ex(id, true); TP_CHECK(r.found); TP_CHECK(!r.ok); TP_CHECK(!r.failed.empty()); TP_CHECK(!r.message.empty()); LOG("failure reported: %s", r.message.c_str());
+    TP_CHECK(fs::exists(f)); TP_CHECK(m.list().size() == 1);                                   // still listed
+    fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace);
+    const auto r2 = m.cancel_ex(id, true); TP_CHECK(r2.ok); TP_CHECK(!fs::exists(f)); TP_CHECK(m.list().empty()); }
+}
 static void sc_overlapping_destinations() {               // two different torrents that use the same file paths
   const auto root = fresh(g_base, "overlap"); static const Content other = Content::make(g_base, 7, "seed_content2");
   Seeder s1(*g_content, next_port(), 0); Seeder s2(other, next_port(), 0); const auto dest = root / "dest";
@@ -531,7 +571,7 @@ int main(int argc, char** argv) {
                     {"completed_modified_between_sessions", sc_completed_modified_between_sessions}, {"completed_modified_no_source", sc_completed_modified_no_source},
                     {"completed_unchanged_restart", sc_completed_unchanged_restart}, {"completed_touched_not_redownloaded", sc_completed_touched_not_redownloaded},
                     {"cancel_delete_scope", sc_cancel_delete_scope}, {"overlapping_destinations", sc_overlapping_destinations},
-                    {"tracker_discovery", sc_tracker_discovery}, {"web_seed_counts_as_source", sc_web_seed_counts_as_source}};
+                    {"tracker_discovery", sc_tracker_discovery}, {"web_seed_counts_as_source", sc_web_seed_counts_as_source}, {"delete_provenance", sc_delete_provenance}};
   int ran = 0;
   for (auto& s : all) {
     bool want = argc <= 1; for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == s.name) want = true;

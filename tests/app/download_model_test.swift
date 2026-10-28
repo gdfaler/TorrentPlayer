@@ -103,6 +103,14 @@ func item(_ s: DownloadState, verified: Int64 = 0, total: Int64 = 1_000_000, rat
         ws.connecting = 2; check(DownloadFormat.discovery(ws).contains("2 connection attempts in progress"), "connection attempts")
         var nt = item(.waitingSources); nt.trackersTotal = 0
         check(DownloadFormat.discovery(nt).contains("lists no trackers"), "torrent without trackers")
+        // cancelling: a failed deletion is reported and keeps the download listed; kept files are reported; a clean removal says nothing
+        check(DownloadCancelOutcome.from(code: 1, message: "") == .removed && DownloadCancelOutcome.removed.alert == nil, "clean removal is silent")
+        let kept = DownloadCancelOutcome.from(code: 2, message: "1 file(s) were left in place")
+        check(kept.alert?.title == "Some files were left in place" && !kept.keepsDownloadListed, "kept files are reported, the download is removed")
+        let bad = DownloadCancelOutcome.from(code: -1, message: "Permission denied")
+        check(bad.keepsDownloadListed && bad.alert?.text == "Permission denied", "a failed deletion keeps the download listed and shows the reason")
+        check(DownloadCancelOutcome.from(code: -1, message: "").alert?.text == "Some files could not be deleted.", "a failure always has a message")
+        check(DownloadCancelOutcome.from(code: 0, message: "") == .notFound && DownloadCancelOutcome.notFound.alert == nil, "unknown download")
         print("download_model_test: \(checks) checks, \(failures) failures")
         exit(failures == 0 ? 0 : 1)
     }

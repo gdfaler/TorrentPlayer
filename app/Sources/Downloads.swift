@@ -52,7 +52,13 @@ final class TPDownloads {
     }
     func pause(_ id: String) { if let p = ptr { _ = tp_dl_pause(p, id) } }
     func resume(_ id: String) { if let p = ptr { _ = tp_dl_resume(p, id) } }
-    func cancel(_ id: String, deleteFiles: Bool) { if let p = ptr { _ = tp_dl_cancel(p, id, deleteFiles ? 1 : 0) } }
+    @discardableResult
+    func cancel(_ id: String, deleteFiles: Bool) -> DownloadCancelOutcome {
+        guard let p = ptr else { return .notFound }
+        var buf = [CChar](repeating: 0, count: 1024)
+        let code = tp_dl_cancel_ex(p, id, deleteFiles ? 1 : 0, &buf, Int32(buf.count))
+        return DownloadCancelOutcome.from(code: code, message: String(cString: buf))
+    }
     func setNetwork(_ online: Bool) { if let p = ptr { tp_dl_set_network(p, online ? 1 : 0) } }
     func setAutoResume(_ on: Bool) { if let p = ptr { tp_dl_set_auto_resume(p, on ? 1 : 0) } }
     func saveAll() { if let p = ptr { tp_dl_save_all(p) } }
@@ -269,8 +275,12 @@ final class DownloadsController: NSObject, NSTableViewDataSource, NSTableViewDel
             guard r == .alertFirstButtonReturn || r == .alertSecondButtonReturn else { return }
             let delete = r == .alertSecondButtonReturn
             self.handledAutoPlay.remove(id); self.defaults.set(Array(self.handledAutoPlay), forKey: "dl.handledAutoPlay")
-            h.cancel(id, deleteFiles: delete); self.telemetry?("download_cancelled", ["deleted": delete])
+            let outcome = h.cancel(id, deleteFiles: delete); self.telemetry?("download_cancelled", ["deleted": delete, "listed_still": outcome.keepsDownloadListed, "note": outcome.alert?.text ?? ""])
             self.refresh()
+            if let note = outcome.alert {
+                let n = NSAlert(); n.messageText = note.title; n.informativeText = note.text; n.alertStyle = outcome.keepsDownloadListed ? .warning : .informational
+                n.addButton(withTitle: "OK"); n.beginSheetModal(for: self.window, completionHandler: nil)
+            }
         }
     }
 }
