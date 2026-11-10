@@ -12,6 +12,7 @@
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/write_resume_data.hpp>
 #include <libtorrent/peer_info.hpp>
+#include <cstdio>
 #include <set>
 #include <sstream>
 #include <sys/stat.h>
@@ -42,7 +43,7 @@ struct DownloadManager::Entry {
   std::vector<std::string> extra_peers;
   std::vector<int> preexisting;                              // torrent files that existed before this download first started: never deleted by it
   std::vector<std::string> fingerprint;                      // size:mtime of each selected file when the download completed (restart fast path)
-  bool auto_play = true, user_paused = false, net_paused = false, completed = false, failed = false;
+  bool auto_play = true, user_paused = false, net_paused = false, completed = false, failed = false, removing = false;
   std::int64_t selected_bytes = 0, last_verified = 0;
   std::chrono::steady_clock::time_point resuming_since{}, no_source_since{}, last_redial{}, last_resume_save{}, last_diag{};
   int redial_backoff_s = 10;
@@ -432,15 +433,33 @@ bool DownloadManager::resume(const std::string& id) {
   persist_state(e);
   return true;
 }
+bool DownloadManager::wait_removed(const std::string& id, double timeout_s) {
+  std::unique_lock<std::mutex> l(rm_mu_);
+  const bool ok = rm_cv_.wait_for(l, std::chrono::duration<double>(timeout_s), [&] { return rm_done_.count(id) > 0; });
+  rm_wait_.erase(id); rm_done_.erase(id);
+  return ok;
+}
+
 bool DownloadManager::cancel(const std::string& id, bool delete_files) { return cancel_ex(id, delete_files).found; }
 
 DownloadCancelResult DownloadManager::cancel_ex(const std::string& id, bool delete_files) {
-  std::lock_guard<std::mutex> g(mu_);
+  std::unique_lock<std::mutex> g(mu_);
   DownloadCancelResult r;
   auto it = entries_.find(id); if (it == entries_.end()) return r;
   r.found = true;
   std::shared_ptr<Entry> e = it->second;
-  if (e->h.is_valid()) { ledger_observe(*e); ses_->remove_torrent(e->h); e->h = lt::torrent_handle(); }   // never libtorrent's delete_files: it removes every file of the torrent, including ones that were the user's
+  if (e->removing) { r.ok = false; r.message = "This download is already being removed."; return r; }
+  if (e->h.is_valid()) {
+    ledger_observe(*e);
+    if (delete_files) { std::lock_guard<std::mutex> rg(rm_mu_); rm_wait_.insert(id); rm_done_.erase(id); }
+    ses_->remove_torrent(e->h); e->h = lt::torrent_handle();
+    if (delete_files) {                                                // wait (not holding mu_: the alert thread needs it) until libtorrent has stopped all disk activity for this torrent
+      e->removing = true; g.unlock();
+      const bool settled = wait_removed(id, 15.0);
+      g.lock(); e->removing = false;
+      if (!settled) std::fprintf(stderr, "tpcore: torrent removal was not confirmed within 15 s; deleting files anyway\n");
+    }
+  }   // (libtorrent's own delete_files is never used: it removes every file of the torrent, including ones that were the user's)
   else ledger_observe(*e);
   if (delete_files && e->ti) {
     // Only files this program provably created are deleted: recorded in the ledger with the identity they had when first seen. Files that were already in the folder, files another download uses
@@ -518,6 +537,12 @@ void DownloadManager::handle_alert(lt::alert* a) {
   if (diag_.is_open() && (a->category() & (lt::alert_category::tracker | lt::alert_category::dht | lt::alert_category::peer | lt::alert_category::connect | lt::alert_category::error))) {
     char t[32]; std::snprintf(t, sizeof t, "[%8.2f] ", std::chrono::duration<double>(std::chrono::steady_clock::now() - diag_t0_).count());
     diag_ << t << a->what() << ": " << a->message() << "\n"; diag_.flush();
+  }
+  if (auto* r = lt::alert_cast<lt::torrent_removed_alert>(a)) {
+    const std::string id = hex20(r->info_hashes.get_best());
+    std::lock_guard<std::mutex> g(rm_mu_);
+    if (rm_wait_.count(id)) { rm_done_.insert(id); rm_cv_.notify_all(); }
+    return;
   }
   if (auto* r = lt::alert_cast<lt::save_resume_data_alert>(a)) {
     const std::string id = hex20(r->handle.info_hashes().get_best());

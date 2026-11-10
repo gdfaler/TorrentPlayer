@@ -462,6 +462,19 @@ static void sc_delete_provenance() {                        // "Delete" removes 
     fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace);
     const auto r2 = m.cancel_ex(id, true); TP_CHECK(r2.ok); TP_CHECK(!fs::exists(f)); TP_CHECK(m.list().empty()); }
 }
+static void sc_delete_no_resurrection() {                    // after "Delete" returns, nothing the transfer was still writing may bring a deleted file back
+  const auto root = fresh(g_base, "delrace"); Seeder fast(*g_content, next_port(), 0); int back = 0; const int rounds = 12;
+  for (int i = 0; i < rounds; ++i) {
+    const auto dest = root / ("r" + std::to_string(i)); tp::DownloadManager m(make_cfg(root / ("state" + std::to_string(i)), next_port()));
+    const auto id = m.add(make_req(*g_content, dest, {kVideo}, fast.ep()));
+    TP_CHECK(wait_for(30, [&] { return st(m, id).verified_bytes > 0; }));
+    const auto t0 = Clock::now(); const auto r = m.cancel_ex(id, true); TP_CHECK(r.ok); TP_CHECK(secs_since(t0) < 5.0);        // removal is confirmed by libtorrent (no 15 s fallback, no deadlock)
+    const auto f = file_of(dest, kVideo); bool reappeared = false;
+    for (int k = 0; k < 30 && !reappeared; ++k) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); std::error_code xe; reappeared = fs::exists(f, xe); }
+    if (reappeared) { ++back; LOG("round %d: the deleted file came back", i); }
+  }
+  LOG("delete_no_resurrection: %d of %d rounds brought the file back", back, rounds); TP_CHECK(back == 0);
+}
 static void sc_overlapping_destinations() {               // two different torrents that use the same file paths
   const auto root = fresh(g_base, "overlap"); static const Content other = Content::make(g_base, 7, "seed_content2");
   Seeder s1(*g_content, next_port(), 0); Seeder s2(other, next_port(), 0); const auto dest = root / "dest";
@@ -571,7 +584,7 @@ int main(int argc, char** argv) {
                     {"completed_modified_between_sessions", sc_completed_modified_between_sessions}, {"completed_modified_no_source", sc_completed_modified_no_source},
                     {"completed_unchanged_restart", sc_completed_unchanged_restart}, {"completed_touched_not_redownloaded", sc_completed_touched_not_redownloaded},
                     {"cancel_delete_scope", sc_cancel_delete_scope}, {"overlapping_destinations", sc_overlapping_destinations},
-                    {"tracker_discovery", sc_tracker_discovery}, {"web_seed_counts_as_source", sc_web_seed_counts_as_source}, {"delete_provenance", sc_delete_provenance}};
+                    {"tracker_discovery", sc_tracker_discovery}, {"web_seed_counts_as_source", sc_web_seed_counts_as_source}, {"delete_provenance", sc_delete_provenance}, {"delete_no_resurrection", sc_delete_no_resurrection}};
   int ran = 0;
   for (auto& s : all) {
     bool want = argc <= 1; for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == s.name) want = true;

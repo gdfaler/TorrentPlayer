@@ -5,6 +5,7 @@
 #include <libtorrent/session.hpp>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -114,10 +116,13 @@ class DownloadManager {
   void ledger_observe(Entry& e);                            // note the identity (device, inode) of files of `e` that now exist
   bool ledger_proves(const std::filesystem::path& p);                    // true only if p exists with the identity recorded when this program created it
   void apply_network_restore();
+  // libtorrent stops touching a removed torrent's files only when it posts torrent_removed_alert; a file deleted before that can be created again by a write that was still queued
+  bool wait_removed(const std::string& id, double timeout_s);
 
   DownloadConfig cfg_;
   std::unique_ptr<lt::session> ses_;
   std::mutex mu_;
+  std::mutex rm_mu_; std::condition_variable rm_cv_; std::set<std::string> rm_wait_, rm_done_;      // removal confirmations (guarded by rm_mu_, never taken while waiting under mu_)
   std::map<std::string, std::shared_ptr<Entry>> entries_;
   std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> created_;
   std::atomic<bool> stop_{false};
