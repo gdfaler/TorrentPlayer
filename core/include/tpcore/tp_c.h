@@ -151,6 +151,9 @@ int tp_dl_get(tp_dlmgr*, const char* id, tp_dl_status* out);      /* 1 if found 
 int tp_dl_pause(tp_dlmgr*, const char* id);
 int tp_dl_resume(tp_dlmgr*, const char* id);
 int tp_dl_cancel(tp_dlmgr*, const char* id, int delete_files);    /* files are kept unless delete_files != 0 */
+/* Same with a report. Returns 0 not found, 1 removed, 2 removed but some files were left in place because they cannot be proven to have been created by this program (msg says which),
+   -1 deletion failed: the download stays in the list (paused) so it can be retried (msg says why). msg may be NULL. */
+int tp_dl_cancel_ex(tp_dlmgr*, const char* id, int delete_files, char* msg, int msg_cap);
 void tp_dl_set_network(tp_dlmgr*, int online);                    /* from the OS path monitor */
 void tp_dl_set_auto_resume(tp_dlmgr*, int on);
 void tp_dl_save_all(tp_dlmgr*);

@@ -167,6 +167,32 @@ struct NetworkPathSummary: Equatable {
     var text: String { headline + " " + detail }
 }
 
+/// What cancelling a download reports: removed cleanly, removed but some files were deliberately left in place, or deleting failed and the download stays in the list.
+enum DownloadCancelOutcome: Equatable {
+    case removed, notFound
+    case keptSome(String)
+    case failed(String)
+
+    static func from(code: Int32, message: String) -> DownloadCancelOutcome {
+        switch code {
+        case 1: return .removed
+        case 2: return .keptSome(message)
+        case -1: return .failed(message.isEmpty ? "Some files could not be deleted." : message)
+        default: return .notFound
+        }
+    }
+    /// A message for the user, or nil when nothing needs saying.
+    var alert: (title: String, text: String)? {
+        switch self {
+        case .removed, .notFound: return nil
+        case .keptSome(let m): return ("Some files were left in place", m + " Delete them in Finder if you no longer want them.")
+        case .failed(let m): return ("The files could not be deleted", m)
+        }
+    }
+    /// Only a failed deletion keeps the download in the list.
+    var keepsDownloadListed: Bool { if case .failed = self { return true } else { return false } }
+}
+
 enum DownloadAutoPlay {
     /// A finished download starts playing by itself only if the user asked for that, it has not done so before and the player is not busy with something else.
     static func shouldStart(_ d: DownloadItem, alreadyHandled: Set<String>, playerBusy: Bool) -> Bool {

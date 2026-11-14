@@ -5,6 +5,7 @@
 #include <libtorrent/session.hpp>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -67,6 +69,13 @@ struct DownloadStatus {
   int connecting = 0;                                        // connection attempts in progress (not counted as sources)
 };
 
+// Outcome of cancelling a download. `ok` is false only when files that had to be deleted could not be, in which case the download stays in the list (paused, with `message`).
+struct DownloadCancelResult {
+  bool found = false, ok = true;
+  std::vector<std::string> deleted, kept, failed;           // kept: files this download cannot prove it created (never touched); failed: deletion errors
+  std::string message;                                      // human-readable summary of kept/failed files, empty when nothing needs saying
+};
+
 class DownloadManager {
  public:
   explicit DownloadManager(DownloadConfig cfg);
@@ -82,6 +91,7 @@ class DownloadManager {
   bool pause(const std::string& id);                                                   // explicit user pause: persisted, never overridden by network changes
   bool resume(const std::string& id);                                                  // explicit user resume (also retries a failed download)
   bool cancel(const std::string& id, bool delete_files);                               // removes the entry; files stay unless delete_files
+  DownloadCancelResult cancel_ex(const std::string& id, bool delete_files);            // same, with a report; a failed deletion keeps the entry (paused) so it can be retried
   void set_network_available(bool online);                                             // fed by the OS path monitor (or tests); coalesced and bounded
   void set_auto_resume_on_network(bool on);
   void save_all();                                                                     // flush resume data now
@@ -100,12 +110,21 @@ class DownloadManager {
   void fill_status(Entry& e, DownloadStatus* out);
   std::filesystem::path dir_of(const std::string& id) const { return cfg_.state_dir / id; }
   bool verified_complete(Entry& e);
+  // provenance of the files this program created (state_dir/created_files.ledger): "dev ino path" per line; ino 0 = recorded before the file existed
+  void ledger_load();
+  void ledger_save();
+  void ledger_observe(Entry& e);                            // note the identity (device, inode) of files of `e` that now exist
+  bool ledger_proves(const std::filesystem::path& p);                    // true only if p exists with the identity recorded when this program created it
   void apply_network_restore();
+  // libtorrent stops touching a removed torrent's files only when it posts torrent_removed_alert; a file deleted before that can be created again by a write that was still queued
+  bool wait_removed(const std::string& id, double timeout_s);
 
   DownloadConfig cfg_;
   std::unique_ptr<lt::session> ses_;
   std::mutex mu_;
+  std::mutex rm_mu_; std::condition_variable rm_cv_; std::set<std::string> rm_wait_, rm_done_;      // removal confirmations (guarded by rm_mu_, never taken while waiting under mu_)
   std::map<std::string, std::shared_ptr<Entry>> entries_;
+  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> created_;
   std::atomic<bool> stop_{false};
   std::thread th_;
   std::atomic<bool> online_{true};

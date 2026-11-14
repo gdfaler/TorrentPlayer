@@ -326,6 +326,17 @@ int tp_dl_get(tp_dlmgr* d, const char* id, tp_dl_status* out) { try { tp::Downlo
 int tp_dl_pause(tp_dlmgr* d, const char* id) { try { return d && id && d->mgr->pause(id) ? 1 : 0; } catch (...) { return 0; } }
 int tp_dl_resume(tp_dlmgr* d, const char* id) { try { return d && id && d->mgr->resume(id) ? 1 : 0; } catch (...) { return 0; } }
 int tp_dl_cancel(tp_dlmgr* d, const char* id, int del) { try { return d && id && d->mgr->cancel(id, del != 0) ? 1 : 0; } catch (...) { return 0; } }
+int tp_dl_cancel_ex(tp_dlmgr* d, const char* id, int del, char* msg, int cap) {
+  try {
+    if (msg && cap > 0) msg[0] = 0;
+    if (!d || !id) return 0;
+    const tp::DownloadCancelResult r = d->mgr->cancel_ex(id, del != 0);
+    if (msg && cap > 0) std::snprintf(msg, static_cast<size_t>(cap), "%s", r.message.c_str());
+    if (!r.found) return 0;
+    if (!r.ok) return -1;
+    return r.kept.empty() ? 1 : 2;
+  } catch (...) { return 0; }
+}
 void tp_dl_set_network(tp_dlmgr* d, int online) { try { if (d) d->mgr->set_network_available(online != 0); } catch (...) {} }
 void tp_dl_set_auto_resume(tp_dlmgr* d, int on) { try { if (d) d->mgr->set_auto_resume_on_network(on != 0); } catch (...) {} }
 void tp_dl_save_all(tp_dlmgr* d) { try { if (d) d->mgr->save_all(); } catch (...) {} }
