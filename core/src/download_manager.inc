@@ -197,6 +197,7 @@ std::shared_ptr<DownloadManager::Entry> DownloadManager::add_locked(const Downlo
   const std::string id = hex20(ti->info_hashes().get_best());
   if (!id_in.empty() && id_in != id) return fail("The stored torrent does not match its identity.");
   auto it = entries_.find(id);
+  if (it != entries_.end() && it->second->removing) return fail("This download is being removed; try again in a moment.");   // cancel_ex is waiting for libtorrent (mu_ is released meanwhile)
   if (it != entries_.end()) return it->second;                       // never a second session for the same torrent
   const auto& fs_ = ti->files();
   auto e = std::make_shared<Entry>();

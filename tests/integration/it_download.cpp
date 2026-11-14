@@ -462,7 +462,7 @@ static void sc_delete_provenance() {                        // "Delete" removes 
     fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace);
     const auto r2 = m.cancel_ex(id, true); TP_CHECK(r2.ok); TP_CHECK(!fs::exists(f)); TP_CHECK(m.list().empty()); }
 }
-static void sc_delete_no_resurrection() {                    // after "Delete" returns, nothing the transfer was still writing may bring a deleted file back
+static void sc_delete_no_resurrection() {                    // after "Delete" returns, nothing the transfer was still writing may bring a deleted file back. NOTE: on loopback the race itself does not fire (this passed before the fix too, verified by mutation); the scenario guards against a deadlock or a missing removal confirmation (cancel_ex must not fall back to its 15 s timeout) and against regressions of the file coming back
   const auto root = fresh(g_base, "delrace"); Seeder fast(*g_content, next_port(), 0); int back = 0; const int rounds = 12;
   for (int i = 0; i < rounds; ++i) {
     const auto dest = root / ("r" + std::to_string(i)); tp::DownloadManager m(make_cfg(root / ("state" + std::to_string(i)), next_port()));
